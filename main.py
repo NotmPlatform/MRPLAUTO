@@ -33,7 +33,6 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 PORT = int(os.getenv("PORT", "8080"))
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 MODERATION_CHAT_ID = int(os.getenv("MODERATION_CHAT_ID", "0"))
-PARTNERSHIP_CHAT_ID = int(os.getenv("PARTNERSHIP_CHAT_ID", str(MODERATION_CHAT_ID or 0)))
 ADMIN_USER_IDS = {
     int(x.strip())
     for x in os.getenv("ADMIN_USER_IDS", "").split(",")
@@ -55,7 +54,6 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required")
 
 PROFILE_NAME, PROFILE_AGE, PROFILE_GENDER, PROFILE_CITY, PROFILE_PHONE = range(5)
-PARTNER_PROPOSAL, PARTNER_PHONE = range(20, 22)
 EVENT_TITLE, EVENT_DATE, EVENT_TIME, EVENT_LOCATION, EVENT_PRICE, EVENT_DESCRIPTION, EVENT_LIMIT, EVENT_BALANCE = range(100, 108)
 
 ACTIVE_REGISTRATION_STATUSES = ("waiting_payment", "waiting_moderation", "approved")
@@ -129,20 +127,6 @@ def init_db() -> None:
             """
         )
         cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS partner_inquiries (
-                id BIGSERIAL PRIMARY KEY,
-                telegram_id BIGINT NOT NULL,
-                username TEXT,
-                telegram_name TEXT,
-                proposal_text TEXT NOT NULL,
-                contact_phone TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'new',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            );
-            """
-        )
-        cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_reg_event_status ON registrations(event_id, status);"
         )
         cur.execute(
@@ -155,27 +139,7 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_USER_IDS
 
 
-def normalize_phone(phone: str) -> Optional[str]:
-    raw = (phone or "").strip().replace(" ", "")
-    digits = re.sub(r"\D", "", raw)
-    if len(digits) < 10 or len(digits) > 15:
-        return None
-    if raw.startswith("8") and len(digits) == 11:
-        return "+7" + digits[1:]
-    if raw.startswith("+"):
-        return "+" + digits
-    return "+" + digits
-
-
-def upsert_user_profile(
-    telegram_id: int,
-    username: Optional[str],
-    full_name: str,
-    age: int,
-    gender: str,
-    city: str,
-    phone: str,
-) -> None:
+def upsert_user_profile(telegram_id: int, username: Optional[str], full_name: str, age: int, gender: str, city: str, phone: str) -> None:
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -203,28 +167,16 @@ def get_user_profile(telegram_id: int):
         return cur.fetchone()
 
 
-def create_event(
-    title: str,
-    event_date: str,
-    event_time: str,
-    location: str,
-    price: Decimal,
-    description: str,
-    total_limit: int,
-    gender_balance_enabled: bool,
-) -> int:
+def create_event(title: str, event_date: str, event_time: str, location: str, price: Decimal, description: str, total_limit: int, gender_balance_enabled: bool) -> int:
     male_limit = female_limit = None
     if gender_balance_enabled:
         male_limit = total_limit // 2
         female_limit = total_limit // 2
-
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO events (
-                title, event_date, event_time, location, price, description, total_limit,
-                gender_balance_enabled, male_limit, female_limit, status
-            )
+            INSERT INTO events (title, event_date, event_time, location, price, description, total_limit,
+                                gender_balance_enabled, male_limit, female_limit, status)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'upcoming')
             RETURNING id;
             """,
@@ -241,9 +193,9 @@ def create_event(
                 female_limit,
             ),
         )
-        row = cur.fetchone()
+        event_id = cur.fetchone()["id"]
         conn.commit()
-        return int(row["id"])
+        return event_id
 
 
 def list_events(limit: int = 20):
@@ -356,8 +308,7 @@ def create_registration_from_profile(event_row, user_row) -> int:
             INSERT INTO registrations (
                 event_id, telegram_id, name_snapshot, age_snapshot, gender_snapshot,
                 city_snapshot, phone_snapshot, status, payment_status
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, 'waiting_payment', 'not_paid')
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'waiting_payment', 'not_paid')
             RETURNING id;
             """,
             (
@@ -372,7 +323,7 @@ def create_registration_from_profile(event_row, user_row) -> int:
         )
         row = cur.fetchone()
         conn.commit()
-        return int(row["id"])
+        return row["id"]
 
 
 def get_registration(registration_id: int):
@@ -393,47 +344,15 @@ def update_registration_status(registration_id: int, status: str, payment_status
     with get_conn() as conn, conn.cursor() as cur:
         if payment_status is None:
             cur.execute(
-                """
-                UPDATE registrations
-                SET status = %s,
-                    moderated_at = CASE WHEN %s IN ('approved', 'rejected') THEN NOW() ELSE moderated_at END
-                WHERE id = %s
-                """,
+                "UPDATE registrations SET status = %s, moderated_at = CASE WHEN %s IN ('approved', 'rejected') THEN NOW() ELSE moderated_at END WHERE id = %s",
                 (status, status, registration_id),
             )
         else:
             cur.execute(
-                """
-                UPDATE registrations
-                SET status = %s,
-                    payment_status = %s,
-                    moderated_at = CASE WHEN %s IN ('approved', 'rejected') THEN NOW() ELSE moderated_at END
-                WHERE id = %s
-                """,
+                "UPDATE registrations SET status = %s, payment_status = %s, moderated_at = CASE WHEN %s IN ('approved', 'rejected') THEN NOW() ELSE moderated_at END WHERE id = %s",
                 (status, payment_status, status, registration_id),
             )
         conn.commit()
-
-
-def create_partner_inquiry(
-    telegram_id: int,
-    username: Optional[str],
-    telegram_name: str,
-    proposal_text: str,
-    contact_phone: str,
-) -> int:
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO partner_inquiries (telegram_id, username, telegram_name, proposal_text, contact_phone)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING id
-            """,
-            (telegram_id, username, telegram_name, proposal_text, contact_phone),
-        )
-        row = cur.fetchone()
-        conn.commit()
-        return int(row["id"])
 
 
 def format_price(value) -> str:
@@ -478,26 +397,24 @@ def render_profile_text(user_row) -> str:
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [["Хочу участвовать"], ["Партнерство"]],
+        [["Участвовать"], ["Мои данные"]],
         resize_keyboard=True,
     )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "Привет.\n\n"
-        "Выберите нужный раздел:\n"
-        "• Хочу участвовать\n"
-        "• Партнерство"
+        "Привет. Здесь можно быстро записаться на актуальное мероприятие.\n\n"
+        "Нажмите «Участвовать», чтобы подать заявку, или «Мои данные», чтобы посмотреть анкету."
     )
     await update.effective_message.reply_text(text, reply_markup=main_menu_keyboard())
 
 
-async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     profile = get_user_profile(update.effective_user.id)
     if not profile or not profile["profile_completed"]:
         await update.effective_message.reply_text(
-            "Анкета пока не заполнена. Нажмите «Хочу участвовать», и бот сохранит данные для следующих заявок.",
+            "Анкета пока не заполнена. Нажмите «Участвовать», и бот соберет данные один раз.",
             reply_markup=main_menu_keyboard(),
         )
         return
@@ -632,14 +549,18 @@ async def profile_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def profile_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = normalize_phone(update.message.text or "")
-    if not phone:
+    phone = (update.message.text or "").strip().replace(" ", "")
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) < 10 or len(digits) > 15:
         await update.message.reply_text("Введите корректный номер телефона.")
         return PROFILE_PHONE
+    if phone.startswith("8") and len(digits) == 11:
+        phone = "+7" + digits[1:]
+    elif not phone.startswith("+"):
+        phone = "+" + digits
 
     form = context.user_data.get("profile_form", {})
     form["phone"] = phone
-
     upsert_user_profile(
         telegram_id=update.effective_user.id,
         username=update.effective_user.username,
@@ -682,73 +603,6 @@ async def profile_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cancel_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("profile_form", None)
     context.user_data.pop("profile_source", None)
-    await update.effective_message.reply_text("Отменено.", reply_markup=main_menu_keyboard())
-    return ConversationHandler.END
-
-
-async def partner_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["partner_form"] = {}
-    await update.effective_message.reply_text(
-        "Напишите ваше предложение по партнерству одним сообщением.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return PARTNER_PROPOSAL
-
-
-async def partner_proposal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    proposal = (update.message.text or "").strip()
-    if len(proposal) < 5:
-        await update.message.reply_text("Опишите предложение чуть подробнее.")
-        return PARTNER_PROPOSAL
-    context.user_data.setdefault("partner_form", {})["proposal_text"] = proposal
-    await update.message.reply_text("Введите контактный номер телефона.")
-    return PARTNER_PHONE
-
-
-async def partner_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = normalize_phone(update.message.text or "")
-    if not phone:
-        await update.message.reply_text("Введите корректный номер телефона.")
-        return PARTNER_PHONE
-
-    form = context.user_data.get("partner_form", {})
-    form["contact_phone"] = phone
-
-    inquiry_id = create_partner_inquiry(
-        telegram_id=update.effective_user.id,
-        username=update.effective_user.username,
-        telegram_name=update.effective_user.full_name,
-        proposal_text=form["proposal_text"],
-        contact_phone=form["contact_phone"],
-    )
-    context.user_data.pop("partner_form", None)
-
-    if PARTNERSHIP_CHAT_ID:
-        username_part = f"@{update.effective_user.username}" if update.effective_user.username else "—"
-        text = (
-            "<b>Новая заявка на партнерство</b>\n"
-            f"ID: {inquiry_id}\n"
-            f"Имя в Telegram: {html.escape(update.effective_user.full_name)}\n"
-            f"Username: {html.escape(username_part)}\n"
-            f"Telegram ID: <code>{update.effective_user.id}</code>\n"
-            f"Телефон: {html.escape(phone)}\n\n"
-            f"<b>Предложение:</b>\n{html.escape(form['proposal_text'])}"
-        )
-        await context.bot.send_message(
-            chat_id=PARTNERSHIP_CHAT_ID,
-            text=text,
-            parse_mode=ParseMode.HTML,
-        )
-
-    await update.message.reply_text(
-        "Спасибо. Заявка на партнерство отправлена.",
-        reply_markup=main_menu_keyboard(),
-    )
-    return ConversationHandler.END
-
-
-async def cancel_partner(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("partner_form", None)
     await update.effective_message.reply_text("Отменено.", reply_markup=main_menu_keyboard())
     return ConversationHandler.END
 
@@ -885,16 +739,20 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"Место: {reg['location']}"
             ),
         )
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text(f"Заявка #{registration_id} подтверждена.")
+        await query.edit_message_text(
+            query.message.text_html + "\n\n✅ Подтверждено",
+            parse_mode=ParseMode.HTML,
+        )
     elif action == "reject":
         update_registration_status(registration_id, "rejected", "rejected")
         await context.bot.send_message(
             chat_id=reg["telegram_id"],
             text="К сожалению, заявка отклонена. Слот освобожден.",
         )
-        await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text(f"Заявка #{registration_id} отклонена.")
+        await query.edit_message_text(
+            query.message.text_html + "\n\n❌ Отклонено",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -907,7 +765,7 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             [InlineKeyboardButton("Список мероприятий", callback_data="admin_list_events")],
         ]
     )
-    await update.effective_message.reply_text("Админ-панель:", reply_markup=keyboard)
+    await update.effective_message.reply_text("Админ-панель", reply_markup=keyboard)
 
 
 async def admin_add_event_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -916,19 +774,14 @@ async def admin_add_event_entry(update: Update, context: ContextTypes.DEFAULT_TY
     if not is_admin(query.from_user.id):
         await query.message.reply_text("У вас нет доступа.")
         return ConversationHandler.END
-
     context.user_data["new_event"] = {}
-    await query.message.reply_text("Название мероприятия?", reply_markup=ReplyKeyboardRemove())
+    await query.message.reply_text("Название мероприятия?")
     return EVENT_TITLE
 
 
 async def admin_event_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    title = (update.message.text or "").strip()
-    if len(title) < 2:
-        await update.message.reply_text("Введите название подлиннее.")
-        return EVENT_TITLE
-    context.user_data.setdefault("new_event", {})["title"] = title
-    await update.message.reply_text("Дата? В формате YYYY-MM-DD, например 2026-04-14")
+    context.user_data.setdefault("new_event", {})["title"] = (update.message.text or "").strip()
+    await update.message.reply_text("Дата мероприятия? Формат: YYYY-MM-DD")
     return EVENT_DATE
 
 
@@ -1001,7 +854,6 @@ async def admin_event_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
     enabled = query.data.split(":", 1)[1] == "on"
     data = context.user_data.get("new_event", {})
     total_limit = data.get("total_limit", 0)
-
     if enabled and total_limit % 2 != 0:
         await query.message.reply_text(
             "Для режима 50/50 общий лимит должен быть четным. Создайте мероприятие заново с четным лимитом."
@@ -1065,11 +917,7 @@ async def admin_list_events(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                 [InlineKeyboardButton("Закрыть набор", callback_data=f"close:{event_row['id']}")],
             ]
         )
-        await target.reply_text(
-            render_event_text(event_row),
-            parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
-        )
+        await target.reply_text(render_event_text(event_row), parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
 async def admin_event_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1078,7 +926,6 @@ async def admin_event_status_callback(update: Update, context: ContextTypes.DEFA
     if not is_admin(query.from_user.id):
         await query.message.reply_text("У вас нет доступа.")
         return
-
     action, raw_id = query.data.split(":", 1)
     event_id = int(raw_id)
     if action == "activate":
@@ -1091,8 +938,9 @@ async def admin_event_status_callback(update: Update, context: ContextTypes.DEFA
 
 async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
-    known = {"Хочу участвовать", "Участвовать", "Партнерство"}
-    if text in known:
+    if text == "Участвовать":
+        return
+    if text == "Мои данные":
         return
     await update.message.reply_text("Используйте кнопки меню ниже.", reply_markup=main_menu_keyboard())
 
@@ -1102,7 +950,7 @@ def build_application() -> Application:
 
     profile_conv = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.Regex(r"^(Хочу участвовать|Участвовать)$"), participate_entry),
+            MessageHandler(filters.Regex(r"^Участвовать$"), participate_entry),
             CallbackQueryHandler(edit_profile_entry, pattern=r"^edit_profile:"),
         ],
         states={
@@ -1117,19 +965,10 @@ def build_application() -> Application:
         per_user=True,
     )
 
-    partner_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^Партнерство$"), partner_entry)],
-        states={
-            PARTNER_PROPOSAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, partner_proposal)],
-            PARTNER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, partner_phone)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_partner)],
-        per_chat=True,
-        per_user=True,
-    )
-
     event_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_add_event_entry, pattern=r"^admin_add_event$")],
+        entry_points=[
+            CallbackQueryHandler(admin_add_event_entry, pattern=r"^admin_add_event$")
+        ],
         states={
             EVENT_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_event_title)],
             EVENT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_event_date)],
@@ -1147,9 +986,8 @@ def build_application() -> Application:
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_menu))
-    application.add_handler(CommandHandler("profile", profile_command))
+    application.add_handler(MessageHandler(filters.Regex(r"^Мои данные$"), show_profile))
     application.add_handler(profile_conv)
-    application.add_handler(partner_conv)
     application.add_handler(event_conv)
     application.add_handler(CallbackQueryHandler(pay_callback, pattern=r"^pay:"))
     application.add_handler(CallbackQueryHandler(paid_callback, pattern=r"^paid:"))
@@ -1199,3 +1037,16 @@ async def on_startup():
         allowed_updates=Update.ALL_TYPES,
     )
     logger.info("Webhook set to %s", webhook_url)
+
+
+@web_app.on_event("shutdown")
+async def on_shutdown():
+    try:
+        await telegram_app.bot.delete_webhook()
+    except Exception as exc:
+        logger.warning("Could not delete webhook: %s", exc)
+    await telegram_app.stop()
+    await telegram_app.shutdown()
+
+
+app = web_app
