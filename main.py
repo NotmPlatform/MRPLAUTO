@@ -103,7 +103,8 @@ LOCAL_TZ = ZoneInfo(TIMEZONE_LABEL)
     EDIT_EVENT_VALUE,
     EDIT_EVENT_POSTER,
     ADMIN_BROADCAST_CONFIRMED_MESSAGE,
-) = range(100, 115)
+    ADMIN_RECEIPT_LINK_MESSAGE,
+) = range(100, 116)
 
 ACTIVE_REGISTRATION_STATUSES = ("waiting_payment", "waiting_moderation", "approved")
 BLOCKING_REGISTRATION_STATUSES = ("waiting_payment", "waiting_moderation", "approved", "waiting_list")
@@ -273,6 +274,7 @@ def init_db() -> None:
                 has_car_snapshot BOOLEAN,
                 consent_snapshot BOOLEAN NOT NULL DEFAULT FALSE,
                 payment_code TEXT,
+                receipt_url TEXT,
                 status TEXT NOT NULL DEFAULT 'waiting_payment',
                 payment_status TEXT NOT NULL DEFAULT 'not_paid',
                 reservation_expires_at TIMESTAMPTZ,
@@ -327,6 +329,7 @@ def init_db() -> None:
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS has_car_snapshot BOOLEAN;")
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS consent_snapshot BOOLEAN NOT NULL DEFAULT FALSE;")
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS payment_code TEXT;")
+        cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS receipt_url TEXT;")
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS reservation_expires_at TIMESTAMPTZ;")
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS payment_reminder_sent_at TIMESTAMPTZ;")
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS before_event_reminder_sent_at TIMESTAMPTZ;")
@@ -451,6 +454,11 @@ def format_rub_amount(value) -> str:
         return format_price(value)
 
 
+def is_valid_receipt_url(value: str) -> bool:
+    value = (value or '').strip()
+    return bool(re.match(r'^https?://\S+$', value))
+
+
 def build_payment_details_text(reg) -> str:
     payment_code = html.escape(str(reg.get("payment_code") or ""))
     return (
@@ -471,6 +479,50 @@ def build_payment_action_keyboard(registration_id: int) -> InlineKeyboardMarkup:
             [InlineKeyboardButton("Отменить заявку", callback_data=f"cancel_reg:{registration_id}")],
         ]
     )
+
+
+def build_moderation_registration_keyboard(reg) -> InlineKeyboardMarkup:
+    receipt_label = "Чек ✓" if reg.get('receipt_url') else "Чек"
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Принять", callback_data=f"approve:{reg['id']}"),
+                InlineKeyboardButton("Нет оплаты", callback_data=f"cancel_nopay:{reg['id']}"),
+            ],
+            [
+                InlineKeyboardButton("Отмена", callback_data=f"cancel_admin:{reg['id']}"),
+                InlineKeyboardButton(receipt_label, callback_data=f"add_receipt:{reg['id']}"),
+            ],
+        ]
+    )
+
+
+def build_moderation_registration_text(reg) -> str:
+    receipt_line = f"\nЧек: {'добавлен' if reg.get('receipt_url') else 'не добавлен'}"
+    return (
+        f"<b>Новая заявка на модерацию</b>\n"
+        f"ID заявки: {reg['id']}\n"
+        f"Код оплаты: {html.escape(str(reg.get('payment_code') or '—'))}\n"
+        f"Ивент: {html.escape(reg['title'])}\n"
+        f"Дата: {reg['event_date']} {html.escape(reg['event_time'])}\n"
+        f"Имя: {html.escape(reg['name_snapshot'])}\n"
+        f"Возраст: {reg['age_snapshot']}\n"
+        f"Пол: {GENDER_LABELS.get(reg['gender_snapshot'], reg['gender_snapshot'])}\n"
+        f"Город: {html.escape(reg['city_snapshot'])}\n"
+        f"Телефон: {html.escape(reg['phone_snapshot'])}\n"
+        + (f"Автомобиль: {human_has_car(reg.get('has_car_snapshot'))}\n" if reg.get('ask_has_car') else "")
+        + f"Согласие ПД: {'Да' if reg['consent_snapshot'] else 'Нет'}"
+        + receipt_line
+    )
+
+
+def set_registration_receipt_url(registration_id: int, receipt_url: str) -> None:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE registrations SET receipt_url = %s WHERE id = %s",
+            (receipt_url, registration_id),
+        )
+        conn.commit()
 
 
 async def send_existing_payment_prompt(message, reg) -> None:
@@ -494,17 +546,25 @@ async def send_existing_payment_prompt(message, reg) -> None:
     await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=build_payment_action_keyboard(reg["id"]))
 
 
-def build_approved_participation_keyboard(registration_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Не смогу прийти", callback_data=f"cant_come:{registration_id}")]]
-    )
+def build_user_receipt_button(receipt_url: Optional[str]):
+    if not receipt_url:
+        return None
+    return InlineKeyboardButton("Чек", url=receipt_url)
 
 
-def build_approved_cancel_confirm_keyboard(registration_id: int) -> InlineKeyboardMarkup:
+def build_approved_participation_keyboard(reg) -> InlineKeyboardMarkup:
+    row = [InlineKeyboardButton("Не смогу прийти", callback_data=f"cant_come:{reg['id']}")]
+    receipt_button = build_user_receipt_button(reg.get('receipt_url'))
+    if receipt_button:
+        row.append(receipt_button)
+    return InlineKeyboardMarkup([row])
+
+
+def build_approved_cancel_confirm_keyboard(reg) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Подтвердить", callback_data=f"cant_come_confirm:{registration_id}")],
-            [InlineKeyboardButton("Назад", callback_data=f"cant_come_back:{registration_id}")],
+            [InlineKeyboardButton("Подтвердить", callback_data=f"cant_come_confirm:{reg['id']}")],
+            [InlineKeyboardButton("Назад", callback_data=f"cant_come_back:{reg['id']}")],
         ]
     )
 
@@ -517,7 +577,7 @@ async def send_existing_approved_prompt(message, reg) -> None:
         f"Место: {html.escape(reg['location'])}\n\n"
         "Если планы изменились, сообщите об этом заранее."
     )
-    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=build_approved_participation_keyboard(reg["id"]))
+    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=build_approved_participation_keyboard(reg))
 
 
 def should_ask_car_question(event_row, user_row) -> bool:
@@ -1932,36 +1992,11 @@ async def paid_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await query.message.reply_text("Спасибо. Заявка отправлена на модерацию. Скоро подтвердим бронь.")
 
     if MODERATION_CHAT_ID:
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("Принять", callback_data=f"approve:{registration_id}"),
-                    InlineKeyboardButton("Нет оплаты", callback_data=f"cancel_nopay:{registration_id}"),
-                ],
-                [
-                    InlineKeyboardButton("Отмена", callback_data=f"cancel_admin:{registration_id}"),
-                ],
-            ]
-        )
-        mod_text = (
-            f"<b>Новая заявка на модерацию</b>\n"
-            f"ID заявки: {registration_id}\n"
-            f"Код оплаты: {html.escape(str(reg.get('payment_code') or '—'))}\n"
-            f"Ивент: {html.escape(reg['title'])}\n"
-            f"Дата: {reg['event_date']} {html.escape(reg['event_time'])}\n"
-            f"Имя: {html.escape(reg['name_snapshot'])}\n"
-            f"Возраст: {reg['age_snapshot']}\n"
-            f"Пол: {GENDER_LABELS.get(reg['gender_snapshot'], reg['gender_snapshot'])}\n"
-            f"Город: {html.escape(reg['city_snapshot'])}\n"
-            f"Телефон: {html.escape(reg['phone_snapshot'])}\n"
-            + (f"Автомобиль: {human_has_car(reg.get('has_car_snapshot'))}\n" if reg.get('ask_has_car') else "")
-            + f"Согласие ПД: {'Да' if reg['consent_snapshot'] else 'Нет'}"
-        )
         sent_message = await context.bot.send_message(
             chat_id=MODERATION_CHAT_ID,
-            text=mod_text,
+            text=build_moderation_registration_text(reg),
             parse_mode=ParseMode.HTML,
-            reply_markup=keyboard,
+            reply_markup=build_moderation_registration_keyboard(reg),
         )
         set_registration_moderation_meta(registration_id, moderation_message_id=sent_message.message_id)
         add_registration_message_link(registration_id, sent_message.message_id, 'root')
@@ -2007,6 +2042,7 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if action == "approve":
         update_registration_status(registration_id, "approved", "paid")
+        reg = get_registration(registration_id)
         await context.bot.send_message(
             chat_id=reg["telegram_id"],
             text=(
@@ -2017,7 +2053,7 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
                 "Если планы изменятся, нажмите кнопку ниже и сообщите об этом заранее."
             ),
             parse_mode=ParseMode.HTML,
-            reply_markup=build_approved_participation_keyboard(registration_id),
+            reply_markup=build_approved_participation_keyboard(reg),
         )
         await query.edit_message_text(
             query.message.text_html + "\n\n✅ Подтверждено",
@@ -2086,11 +2122,11 @@ async def user_cancel_after_approval_callback(update: Update, context: ContextTy
         await query.message.reply_text("Эту заявку уже нельзя отменить через эту кнопку.")
         return
     try:
-        await query.edit_message_reply_markup(reply_markup=build_approved_cancel_confirm_keyboard(registration_id))
+        await query.edit_message_reply_markup(reply_markup=build_approved_cancel_confirm_keyboard(reg))
     except Exception:
         await query.message.reply_text(
             "Подтвердите отмену участия.",
-            reply_markup=build_approved_cancel_confirm_keyboard(registration_id),
+            reply_markup=build_approved_cancel_confirm_keyboard(reg),
         )
 
 
@@ -2103,7 +2139,7 @@ async def user_cancel_after_approval_back_callback(update: Update, context: Cont
         await query.message.reply_text("Заявка не найдена.")
         return
     try:
-        await query.edit_message_reply_markup(reply_markup=build_approved_participation_keyboard(registration_id))
+        await query.edit_message_reply_markup(reply_markup=build_approved_participation_keyboard(reg))
     except Exception:
         pass
 
@@ -2771,6 +2807,8 @@ def build_confirmed_export_bytes(event_row) -> bytes:
         "has_car",
         "status",
         "payment_status",
+        "payment_code",
+        "receipt_url",
         "created_at",
     ])
     for row in approved_rows:
@@ -2785,6 +2823,8 @@ def build_confirmed_export_bytes(event_row) -> bytes:
             human_has_car(row.get("has_car_snapshot") if row.get("has_car_snapshot") is not None else row.get("user_has_car")),
             row["status"],
             row["payment_status"],
+            row.get("payment_code"),
+            row.get("receipt_url"),
             row["created_at"],
         ])
     return output.getvalue().encode("utf-8-sig")
@@ -3041,7 +3081,84 @@ async def background_maintenance(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("Background maintenance failed: %s", exc)
 
 
+async def admin_add_receipt_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text("У вас нет доступа.")
+        return
+
+    registration_id = int(query.data.split(":", 1)[1])
+    reg = get_registration(registration_id)
+    if not reg:
+        await query.message.reply_text("Заявка не найдена.")
+        return
+
+    context.user_data['awaiting_receipt_registration_id'] = registration_id
+    await query.message.reply_text(
+        "Отправьте ссылку на чек одним сообщением.\nДля отмены отправьте «Отмена»."
+    )
+
+
+async def admin_receipt_link_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or update.effective_chat.id != MODERATION_CHAT_ID or not is_admin(update.effective_user.id):
+        return
+
+    registration_id = context.user_data.get('awaiting_receipt_registration_id')
+    if not registration_id:
+        return
+
+    text_value = (message.text or '').strip()
+    if text_value == CANCEL_EDIT_TEXT:
+        context.user_data.pop('awaiting_receipt_registration_id', None)
+        await message.reply_text("Добавление чека отменено.")
+        return
+
+    if not is_valid_receipt_url(text_value):
+        await message.reply_text("Отправьте полную ссылку на чек, начиная с http:// или https://")
+        return
+
+    context.user_data.pop('awaiting_receipt_registration_id', None)
+    context.user_data['receipt_input_handled'] = True
+    set_registration_receipt_url(registration_id, text_value)
+    reg = get_registration(registration_id)
+    if not reg:
+        await message.reply_text("Чек сохранён, но заявка уже не найдена.")
+        return
+
+    if reg.get('moderation_message_id') and reg.get('status') == 'waiting_moderation':
+        try:
+            await context.bot.edit_message_text(
+                chat_id=MODERATION_CHAT_ID,
+                message_id=reg['moderation_message_id'],
+                text=build_moderation_registration_text(reg),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_moderation_registration_keyboard(reg),
+            )
+        except Exception as exc:
+            logger.warning("Could not update moderation message with receipt for %s: %s", registration_id, exc)
+
+    await message.reply_text(f"Чек сохранён для заявки #{registration_id}.")
+
+    if reg['status'] == 'approved':
+        try:
+            await context.bot.send_message(
+                chat_id=reg['telegram_id'],
+                text=(
+                    f"<b>Чек по оплате добавлен</b>\n\n"
+                    f"Мероприятие: <b>{html.escape(reg['title'])}</b>"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_approved_participation_keyboard(reg),
+            )
+        except Exception as exc:
+            logger.warning("Could not send receipt link to user %s: %s", reg['telegram_id'], exc)
+
+
 async def moderation_admin_reply_bridge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.user_data.pop('receipt_input_handled', False):
+        return
     message = update.effective_message
     if not message or not message.reply_to_message:
         return
@@ -3238,7 +3355,9 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(admin_stats_callback, pattern=r"^stats:"))
     application.add_handler(CallbackQueryHandler(admin_export_callback, pattern=r"^export:"))
     application.add_handler(CallbackQueryHandler(admin_send_standard_reminder_callback, pattern=r"^remind_confirmed:"))
-    application.add_handler(MessageHandler(filters.Chat(MODERATION_CHAT_ID) & filters.TEXT & ~filters.COMMAND, moderation_admin_reply_bridge))
+    application.add_handler(CallbackQueryHandler(admin_add_receipt_callback, pattern=r"^add_receipt:"))
+    application.add_handler(MessageHandler(filters.Chat(MODERATION_CHAT_ID) & filters.TEXT & ~filters.COMMAND, admin_receipt_link_input), group=1)
+    application.add_handler(MessageHandler(filters.Chat(MODERATION_CHAT_ID) & filters.TEXT & ~filters.COMMAND, moderation_admin_reply_bridge), group=2)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_text))
 
     return application
