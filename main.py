@@ -5,6 +5,7 @@ import io
 import logging
 import os
 import re
+import secrets
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Optional
@@ -58,6 +59,7 @@ SBP_RECEIVER = os.getenv("SBP_RECEIVER", "Баранцев А.М.")
 TIMEZONE_LABEL = os.getenv("TIMEZONE_LABEL", "Europe/Moscow")
 PAYMENT_TIMEOUT_MINUTES = int(os.getenv("PAYMENT_TIMEOUT_MINUTES", "30"))
 PAYMENT_REMINDER_BEFORE_MINUTES = int(os.getenv("PAYMENT_REMINDER_BEFORE_MINUTES", "15"))
+PAYMENT_CODE_LENGTH = int(os.getenv("PAYMENT_CODE_LENGTH", "6"))
 EVENT_REMINDER_BEFORE_HOURS = int(os.getenv("EVENT_REMINDER_BEFORE_HOURS", "24"))
 BACKGROUND_CHECK_INTERVAL_SECONDS = int(os.getenv("BACKGROUND_CHECK_INTERVAL_SECONDS", "300"))
 
@@ -183,6 +185,32 @@ def cleanup_duplicate_blocking_registrations(cur) -> None:
     )
 
 
+def generate_payment_code() -> str:
+    min_value = 10 ** max(PAYMENT_CODE_LENGTH - 1, 0)
+    max_value = (10 ** PAYMENT_CODE_LENGTH) - 1
+    return str(secrets.randbelow(max_value - min_value + 1) + min_value)
+
+
+def generate_unique_payment_code(cur) -> str:
+    for _ in range(100):
+        code = generate_payment_code()
+        cur.execute("SELECT 1 FROM registrations WHERE payment_code = %s LIMIT 1", (code,))
+        if cur.fetchone() is None:
+            return code
+    raise RuntimeError("Could not generate unique payment code")
+
+
+def backfill_missing_payment_codes(cur) -> None:
+    cur.execute("SELECT id FROM registrations WHERE payment_code IS NULL ORDER BY id ASC")
+    rows = cur.fetchall()
+    for row in rows:
+        code = generate_unique_payment_code(cur)
+        cur.execute(
+            "UPDATE registrations SET payment_code = %s WHERE id = %s",
+            (code, row["id"]),
+        )
+
+
 def init_db() -> None:
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -241,6 +269,7 @@ def init_db() -> None:
                 phone_snapshot TEXT NOT NULL,
                 has_car_snapshot BOOLEAN,
                 consent_snapshot BOOLEAN NOT NULL DEFAULT FALSE,
+                payment_code TEXT,
                 status TEXT NOT NULL DEFAULT 'waiting_payment',
                 payment_status TEXT NOT NULL DEFAULT 'not_paid',
                 reservation_expires_at TIMESTAMPTZ,
@@ -284,6 +313,7 @@ def init_db() -> None:
 
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS has_car_snapshot BOOLEAN;")
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS consent_snapshot BOOLEAN NOT NULL DEFAULT FALSE;")
+        cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS payment_code TEXT;")
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS reservation_expires_at TIMESTAMPTZ;")
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS payment_reminder_sent_at TIMESTAMPTZ;")
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS before_event_reminder_sent_at TIMESTAMPTZ;")
@@ -299,6 +329,7 @@ def init_db() -> None:
             "CREATE INDEX IF NOT EXISTS idx_reg_reservation_expires ON registrations(reservation_expires_at);"
         )
         cleanup_duplicate_blocking_registrations(cur)
+        backfill_missing_payment_codes(cur)
 
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_status_date ON events(status, event_date);"
@@ -317,6 +348,13 @@ def init_db() -> None:
             CREATE UNIQUE INDEX IF NOT EXISTS uniq_reg_one_active_per_user_event
             ON registrations(event_id, telegram_id)
             WHERE status IN ('waiting_payment', 'waiting_moderation', 'approved', 'waiting_list');
+            """
+        )
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uniq_reg_payment_code
+            ON registrations(payment_code)
+            WHERE payment_code IS NOT NULL;
             """
         )
         conn.commit()
@@ -382,11 +420,27 @@ def human_has_car(value) -> str:
     return "Не указано"
 
 
-def build_payment_details_text(registration_id: int) -> str:
+def format_rub_amount(value) -> str:
+    if value is None:
+        return "0"
+    try:
+        amount = Decimal(str(value))
+        if amount == amount.to_integral():
+            return f"{int(amount):,}".replace(",", " ")
+        return f"{amount:,.2f}".replace(",", " ").replace(".", ",")
+    except Exception:
+        return format_price(value)
+
+
+def build_payment_details_text(reg) -> str:
+    payment_code = html.escape(str(reg.get("payment_code") or ""))
     return (
-        f"Оплата по СБП по номеру телефона:\n<code>{html.escape(SBP_PHONE)}</code>\n\n"
-        f"Получатель: {html.escape(SBP_RECEIVER)}\n\n"
-        f"В комментарии к переводу укажите ID заявки:\n<code>{registration_id}</code>"
+        f"Сумма к оплате: <b>{html.escape(format_rub_amount(reg.get('price')))} ₽</b>\n\n"
+        f"Оплата по СБП\n"
+        f"Номер телефона:\n<code>{html.escape(SBP_PHONE)}</code>\n\n"
+        f"Получатель:\n{html.escape(SBP_RECEIVER)}\n\n"
+        f"Комментарий к переводу:\n<code>{payment_code}</code>\n\n"
+        "Важно: укажите комментарий точно как в примере."
     )
 
 
@@ -412,12 +466,12 @@ async def send_existing_payment_prompt(message, reg) -> None:
 
     expires_text = expires_at.astimezone(LOCAL_TZ).strftime("%H:%M") if expires_at else "—"
     text = (
-        f"У вас уже есть незавершённая заявка на <b>{html.escape(reg['title'])}</b>.\n\n"
-        f"ID заявки: <code>{reg['id']}</code>\n\n"
-        f"⏳ Место всё ещё забронировано за вами до {expires_text}.\n\n"
-        f"{build_payment_details_text(reg['id'])}\n\n"
-        + (f"{html.escape(PAYMENT_TEXT)}\n\n" if PAYMENT_TEXT else "")
-        + "Либо оплатите и нажмите «Я оплатил», либо удалите заявку." 
+        "<b>Заявка почти завершена ✅</b>\n\n"
+        f"Мероприятие: <b>{html.escape(reg['title'])}</b>\n\n"
+        f"⏳ Бронь места действует до <b>{expires_text}</b>.\n\n"
+        f"{build_payment_details_text(reg)}\n\n"
+        "После перевода нажмите кнопку «Я оплатил».\n"
+        "Если передумали — нажмите «Отменить заявку»."
     )
     await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=build_payment_action_keyboard(reg["id"]))
 
@@ -673,7 +727,7 @@ def get_latest_waiting_payment_registration_for_user(telegram_id: int):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.status AS event_status
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price, e.status AS event_status
             FROM registrations r
             JOIN events e ON e.id = r.event_id
             WHERE r.telegram_id = %s
@@ -782,45 +836,54 @@ def create_registration_from_profile(event_row, user_row, status: str = "waiting
         expires_at = now_local() + timedelta(minutes=PAYMENT_TIMEOUT_MINUTES)
 
     with get_conn() as conn, conn.cursor() as cur:
-        try:
-            cur.execute(
-                """
-                INSERT INTO registrations (
-                    event_id, telegram_id, name_snapshot, age_snapshot, gender_snapshot,
-                    city_snapshot, phone_snapshot, has_car_snapshot, consent_snapshot, status, payment_status,
-                    reservation_expires_at
+        for _ in range(20):
+            payment_code = generate_unique_payment_code(cur)
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO registrations (
+                        event_id, telegram_id, name_snapshot, age_snapshot, gender_snapshot,
+                        city_snapshot, phone_snapshot, has_car_snapshot, consent_snapshot, payment_code,
+                        status, payment_status, reservation_expires_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id;
+                    """,
+                    (
+                        event_row["id"],
+                        user_row["telegram_id"],
+                        user_row["full_name"],
+                        user_row["age"],
+                        user_row["gender"],
+                        user_row["city"],
+                        user_row["phone"],
+                        user_row.get("has_car"),
+                        bool(user_row.get("consent_personal_data")),
+                        payment_code,
+                        status,
+                        "not_paid" if status == "waiting_payment" else "not_required",
+                        expires_at,
+                    ),
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id;
-                """,
-                (
-                    event_row["id"],
-                    user_row["telegram_id"],
-                    user_row["full_name"],
-                    user_row["age"],
-                    user_row["gender"],
-                    user_row["city"],
-                    user_row["phone"],
-                    user_row.get("has_car"),
-                    bool(user_row.get("consent_personal_data")),
-                    status,
-                    "not_paid" if status == "waiting_payment" else "not_required",
-                    expires_at,
-                ),
-            )
-            row = cur.fetchone()
-            conn.commit()
-            return row["id"]
-        except UniqueViolation:
-            conn.rollback()
-            raise DuplicateRegistrationError
+                row = cur.fetchone()
+                conn.commit()
+                return row["id"]
+            except UniqueViolation as exc:
+                conn.rollback()
+                constraint_name = getattr(getattr(exc, "diag", None), "constraint_name", "") or ""
+                if constraint_name == "uniq_reg_one_active_per_user_event":
+                    raise DuplicateRegistrationError
+                if constraint_name == "uniq_reg_payment_code":
+                    continue
+                raise
+        raise RuntimeError("Could not create registration with unique payment code")
 
 
 def get_registration(registration_id: int):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.status AS event_status,
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price, e.status AS event_status,
                    e.total_limit, e.gender_balance_enabled, e.min_age, e.max_age, e.ask_has_car,
                    u.has_car AS user_has_car
             FROM registrations r
@@ -837,7 +900,7 @@ def get_waiting_list_for_event(event_id: int):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT r.*, e.title, e.event_date, e.event_time, e.location
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price
             FROM registrations r
             JOIN events e ON e.id = r.event_id
             WHERE r.event_id = %s AND r.status = 'waiting_list'
@@ -940,7 +1003,7 @@ def get_due_payment_reminders():
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT r.*, e.title, e.event_date, e.event_time, e.location
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price
             FROM registrations r
             JOIN events e ON e.id = r.event_id
             WHERE r.status = 'waiting_payment'
@@ -958,7 +1021,7 @@ def get_expired_registrations():
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT r.*, e.title, e.event_date, e.event_time, e.location
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price
             FROM registrations r
             JOIN events e ON e.id = r.event_id
             WHERE r.status = 'waiting_payment'
@@ -975,7 +1038,7 @@ def get_due_event_reminders():
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.status AS event_status
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price, e.status AS event_status
             FROM registrations r
             JOIN events e ON e.id = r.event_id
             WHERE r.status = 'approved'
@@ -1642,12 +1705,12 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     expires_text = expires_at.astimezone(LOCAL_TZ).strftime("%H:%M") if expires_at else "—"
     keyboard = build_payment_action_keyboard(registration_id)
     text = (
-        f"Заявка создана на мероприятие <b>{html.escape(event_row['title'])}</b>.\n\n"
-        f"ID заявки: <code>{registration_id}</code>\n\n"
-        f"⏳ Место забронировано за вами на {PAYMENT_TIMEOUT_MINUTES} минут — до {expires_text}.\n\n"
-        f"{build_payment_details_text(registration_id)}\n\n"
-        + (f"{html.escape(PAYMENT_TEXT)}\n\n" if PAYMENT_TEXT else "")
-        + "После оплаты нажмите кнопку «Я оплатил»."
+        "<b>Заявка создана ✅</b>\n\n"
+        f"Мероприятие: <b>{html.escape(event_row['title'])}</b>\n\n"
+        f"⏳ Бронь места действует до <b>{expires_text}</b>.\n\n"
+        f"{build_payment_details_text(reg)}\n\n"
+        "После перевода нажмите кнопку «Я оплатил».\n"
+        "Если передумали — нажмите «Отменить заявку»."
     )
     await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
@@ -1724,6 +1787,7 @@ async def paid_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         mod_text = (
             f"<b>Новая заявка на модерацию</b>\n"
             f"ID заявки: {registration_id}\n"
+            f"Код оплаты: {html.escape(str(reg.get('payment_code') or '—'))}\n"
             f"Ивент: {html.escape(reg['title'])}\n"
             f"Дата: {reg['event_date']} {html.escape(reg['event_time'])}\n"
             f"Имя: {html.escape(reg['name_snapshot'])}\n"
@@ -2415,6 +2479,7 @@ def build_confirmed_export_bytes(event_row) -> bytes:
     writer.writerow([])
     writer.writerow([
         "registration_id",
+        "payment_code",
         "name",
         "age",
         "gender",
@@ -2428,6 +2493,7 @@ def build_confirmed_export_bytes(event_row) -> bytes:
     for row in approved_rows:
         writer.writerow([
             row["id"],
+            row.get("payment_code"),
             row["name_snapshot"],
             row["age_snapshot"],
             GENDER_LABELS.get(row["gender_snapshot"], row["gender_snapshot"]),
@@ -2518,16 +2584,18 @@ async def promote_waiting_list_for_event(context: ContextTypes.DEFAULT_TYPE, eve
         expires_at = set_registration_waiting_payment(row["id"])
         expires_text = expires_at.astimezone(LOCAL_TZ).strftime("%H:%M")
         keyboard = build_payment_action_keyboard(row["id"])
+        reg = get_registration(row["id"])
         try:
             await context.bot.send_message(
                 chat_id=row["telegram_id"],
                 text=(
-                    f"Освободилось место на <b>{html.escape(row['title'])}</b> ✅\n\n"
-                    f"ID заявки: <code>{row['id']}</code>\n\n"
-                    f"Вы были в листе ожидания и автоматически переведены в этап оплаты.\n"
-                    f"⏳ Место держится до {expires_text}.\n\n"
-                    f"{build_payment_details_text(row['id'])}\n\n"
-                    + (f"{html.escape(PAYMENT_TEXT)}" if PAYMENT_TEXT else "")
+                    "<b>Место освободилось ✅</b>\n\n"
+                    f"Мероприятие: <b>{html.escape(row['title'])}</b>\n\n"
+                    "Вы были в листе ожидания и автоматически переведены к оплате.\n\n"
+                    f"⏳ Бронь места действует до <b>{expires_text}</b>.\n\n"
+                    f"{build_payment_details_text(reg)}\n\n"
+                    "После перевода нажмите кнопку «Я оплатил».\n"
+                    "Если передумали — нажмите «Отменить заявку»."
                 ),
                 parse_mode=ParseMode.HTML,
                 reply_markup=keyboard,
