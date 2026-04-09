@@ -127,8 +127,8 @@ EVENT_STATUS_LABELS = {
 }
 PARTICIPATE_BUTTONS = {"Участвовать", "Хочу участвовать"}
 PARTNER_BUTTON = "Партнерство"
-SKIP_POSTER_TEXT = "Пропустить афишу"
-REMOVE_POSTER_TEXT = "Удалить афишу"
+SKIP_POSTER_TEXT = "Пропустить фото"
+REMOVE_POSTER_TEXT = "Удалить фото"
 CANCEL_EDIT_TEXT = "Отмена"
 YES_NO_KEYBOARD = [["Да", "Нет"]]
 
@@ -1026,7 +1026,7 @@ def render_partner_request_text(partner_id: int, data: dict) -> str:
 
 def build_edit_event_keyboard(event_row) -> InlineKeyboardMarkup:
     event_id = event_row["id"]
-    poster_label = "Редактировать афишу" if event_row.get("poster_file_id") else "Добавить афишу"
+    poster_label = "Редактировать фото" if event_row.get("poster_file_id") else "Добавить фото"
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton(poster_label, callback_data=f"edit_event_field:poster:{event_id}")],
@@ -1995,7 +1995,7 @@ async def admin_event_car_question(update: Update, context: ContextTypes.DEFAULT
     data["ask_has_car"] = enabled
     keyboard = ReplyKeyboardMarkup([[SKIP_POSTER_TEXT]], resize_keyboard=True, one_time_keyboard=True)
     await query.message.reply_text(
-        "Теперь отправьте афишу одним фото. Если пока без афиши — нажмите «Пропустить афишу».",
+        "Теперь отправьте афишу одним фото. Если пока без афиши — нажмите «Пропустить».",
         reply_markup=keyboard,
     )
     return EVENT_POSTER
@@ -2014,7 +2014,7 @@ async def admin_event_poster(update: Update, context: ContextTypes.DEFAULT_TYPE)
         text_value = (update.message.text or "").strip()
         if text_value != SKIP_POSTER_TEXT:
             await update.message.reply_text(
-                "Отправьте одно фото афиши или нажмите «Пропустить афишу».",
+                "Отправьте одно фото афиши или нажмите «Пропустить фото».",
                 reply_markup=ReplyKeyboardMarkup([[SKIP_POSTER_TEXT]], resize_keyboard=True, one_time_keyboard=True),
             )
             return EVENT_POSTER
@@ -2278,7 +2278,7 @@ async def admin_edit_event_poster(update: Update, context: ContextTypes.DEFAULT_
             return ConversationHandler.END
         else:
             await update.message.reply_text(
-                "Отправьте одно фото, либо выберите «Удалить афишу» или «Отмена»."
+                "Отправьте одно фото, либо выберите «Удалить фото» или «Отмена»."
             )
             return EDIT_EVENT_POSTER
 
