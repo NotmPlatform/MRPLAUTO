@@ -15,7 +15,6 @@ from fastapi import FastAPI, HTTPException, Request
 from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 from telegram import (
-    BufferedInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
@@ -763,26 +762,12 @@ def get_due_event_reminders():
     return due
 
 
-def render_event_text(event_row, *, for_admin: bool = False) -> str:
-    description = html.escape(event_row.get("description") or "")
-    places_left = max(int(event_row["total_limit"]) - count_active_registrations(event_row["id"]), 0)
-
-    if not for_admin:
-        return (
-            f"<b>{html.escape(event_row['title'])}</b>\n"
-            f"Дата: {event_row['event_date']}\n"
-            f"Время: {html.escape(event_row['event_time'])}\n"
-            f"Место: {html.escape(event_row['location'])}\n"
-            f"Цена: {format_price(event_row['price'])}\n"
-            f"Мест осталось: {places_left}\n"
-            f"Возраст: {event_row.get('min_age', 18)}–{event_row.get('max_age', 99)}"
-            + (f"\nОписание: {description}" if description else "")
-        )
-
+def render_event_text(event_row) -> str:
     balance = "Включен" if event_row["gender_balance_enabled"] else "Выключен"
     extra = ""
     if event_row["gender_balance_enabled"]:
         extra = f"\nБаланс М/Ж: {event_row['male_limit']}/{event_row['female_limit']}"
+    description = html.escape(event_row.get("description") or "")
     return (
         f"<b>{html.escape(event_row['title'])}</b>\n"
         f"ID: {event_row['id']}\n"
@@ -792,11 +777,26 @@ def render_event_text(event_row, *, for_admin: bool = False) -> str:
         f"Цена: {format_price(event_row['price'])}\n"
         f"Статус: {html.escape(human_event_status(event_row['status']))}\n"
         f"Лимит: {event_row['total_limit']}\n"
-        f"Свободно мест: {places_left}\n"
         f"Возраст: {event_row.get('min_age', 18)}–{event_row.get('max_age', 99)}\n"
         f"50/50: {balance}{extra}"
         + (f"\nОписание: {description}" if description else "")
     )
+
+
+def render_public_event_text(event_row) -> str:
+    description = html.escape(event_row.get("description") or "")
+    places_left = max(0, int(event_row['total_limit']) - count_active_registrations(event_row['id']))
+    return (
+        f"<b>{html.escape(event_row['title'])}</b>\n"
+        f"Дата: {event_row['event_date']}\n"
+        f"Время: {html.escape(event_row['event_time'])}\n"
+        f"Место: {html.escape(event_row['location'])}\n"
+        f"Цена: {format_price(event_row['price'])}\n"
+        f"Мест осталось: {places_left}\n"
+        f"Возраст: {event_row.get('min_age', 18)}–{event_row.get('max_age', 99)}"
+        + (f"\nОписание: {description}" if description else "")
+    )
+
 
 def render_profile_text(user_row) -> str:
     consent_label = "Да" if user_row.get("consent_personal_data") else "Нет"
@@ -924,7 +924,7 @@ async def participate_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["profile_source"] = "participate"
     context.user_data["profile_form"] = {}
     await update.effective_message.reply_text(
-        f"Сейчас открыта запись на:\n\n{render_event_text(event_row)}\n\nКак вас зовут? (Напишите ваше имя)",
+        f"Сейчас открыта запись на:\n\n{render_public_event_text(event_row)}\n\nКак вас зовут? (Напишите ваше имя)",
         parse_mode=ParseMode.HTML,
         reply_markup=ReplyKeyboardRemove(),
     )
@@ -935,7 +935,7 @@ async def send_event_and_profile_confirmation(message, profile, event_row) -> No
     age_ok, age_reason = check_age_allowed(event_row, profile["age"])
     if not age_ok:
         text = (
-            f"Сейчас открыта запись на:\n\n{render_event_text(event_row)}\n\n"
+            f"Сейчас открыта запись на:\n\n{render_public_event_text(event_row)}\n\n"
             f"{render_profile_text(profile)}\n\n"
             f"⚠️ {html.escape(age_reason)}"
         )
@@ -948,7 +948,7 @@ async def send_event_and_profile_confirmation(message, profile, event_row) -> No
     slot_ok, slot_reason = check_slot_available(event_row, profile["gender"])
     if slot_ok:
         text = (
-            f"Сейчас открыта запись на:\n\n{render_event_text(event_row)}\n\n"
+            f"Сейчас открыта запись на:\n\n{render_public_event_text(event_row)}\n\n"
             f"{render_profile_text(profile)}\n\n"
             f"Если все верно, переходите к оплате. После создания заявки место бронируется на {PAYMENT_TIMEOUT_MINUTES} минут."
         )
@@ -956,7 +956,7 @@ async def send_event_and_profile_confirmation(message, profile, event_row) -> No
         return
 
     text = (
-        f"Сейчас открыта запись на:\n\n{render_event_text(event_row)}\n\n"
+        f"Сейчас открыта запись на:\n\n{render_public_event_text(event_row)}\n\n"
         f"{render_profile_text(profile)}\n\n"
         f"⚠️ {html.escape(slot_reason)}\n"
         "Можно встать в лист ожидания. Если место освободится, бот напишет автоматически."
@@ -1338,7 +1338,7 @@ async def admin_show_active_event(update: Update, context: ContextTypes.DEFAULT_
     if not event_row:
         await query.message.reply_text("Сейчас нет активного мероприятия.")
         return
-    text = render_event_text(event_row, for_admin=True) + "\n\n" + build_event_stats_text(event_row)
+    text = render_event_text(event_row) + "\n\n" + build_event_stats_text(event_row)
     await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=build_active_event_keyboard(event_row["id"]))
 
 
@@ -1494,7 +1494,7 @@ async def admin_event_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     event_row = get_event(event_id)
     await query.message.reply_text(
-        "Мероприятие создано.\n\n" + render_event_text(event_row, for_admin=True),
+        "Мероприятие создано.\n\n" + render_event_text(event_row),
         parse_mode=ParseMode.HTML,
         reply_markup=build_active_event_keyboard(event_id),
     )
@@ -1527,7 +1527,7 @@ async def admin_list_events(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     for event_row in events:
-        text = render_event_text(event_row, for_admin=True) + "\n\n" + build_event_stats_text(event_row)
+        text = render_event_text(event_row) + "\n\n" + build_event_stats_text(event_row)
         await target.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=build_active_event_keyboard(event_row["id"]))
 
 
@@ -1612,9 +1612,11 @@ async def admin_export_callback(update: Update, context: ContextTypes.DEFAULT_TY
     share = round((approved / max(int(event_row["total_limit"]), 1)) * 100, 1)
     csv_bytes = build_confirmed_export_bytes(event_row)
     filename = f"confirmed_event_{event_id}.csv"
+    file_obj = io.BytesIO(csv_bytes)
+    file_obj.name = filename
     await context.bot.send_document(
         chat_id=query.message.chat_id,
-        document=BufferedInputFile(csv_bytes, filename=filename),
+        document=file_obj,
         caption=(
             f"Экспорт по мероприятию #{event_id}.\n"
             f"Подтверждено: {approved}/{event_row['total_limit']} ({share}%)."
