@@ -455,13 +455,13 @@ def build_payment_details_text(reg) -> str:
     payment_code = html.escape(str(reg.get("payment_code") or ""))
     return (
         f"Сумма к оплате: <b>{html.escape(format_rub_amount(reg.get('price')))} ₽</b>\n\n"
-        f"Оплата по СБП\n"
-        f"Номер телефона:\n<code>{html.escape(SBP_PHONE)}</code>\n\n"
-        f"Получатель:\n{html.escape(SBP_RECEIVER)}\n\n"
-        f"Комментарий к переводу:\n<code>{payment_code}</code>\n\n"
-        "Важно: укажите комментарий точно как в примере."
+        "Номер телефона\n"
+        "(оплата по СБП на Сбербанк)\n\n"
+        f"<code>{html.escape(SBP_PHONE)}</code>\n\n"
+        f"Получатель: {html.escape(SBP_RECEIVER)}\n\n"
+        "Комментарий к переводу (обязательно)\n\n"
+        f"<code>{payment_code}</code>"
     )
-
 
 
 def build_payment_action_keyboard(registration_id: int) -> InlineKeyboardMarkup:
@@ -490,7 +490,6 @@ async def send_existing_payment_prompt(message, reg) -> None:
         f"⏳ Бронь места действует до <b>{expires_text}</b>.\n\n"
         f"{build_payment_details_text(reg)}\n\n"
         "После перевода нажмите кнопку «Я оплатил».\n"
-        "Если передумали — нажмите «Отменить заявку»."
     )
     await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=build_payment_action_keyboard(reg["id"]))
 
@@ -1321,16 +1320,25 @@ async def send_event_card(message, event_row, *, public: bool, intro: Optional[s
             caption = "\n\n".join(caption_parts)
             if len(caption) > 1024:
                 caption = caption[:1020] + "…"
-        await message.reply_photo(
-            photo=event_row["poster_file_id"],
-            caption=caption,
-            parse_mode=ParseMode.HTML,
-            reply_markup=reply_markup,
-        )
-        if extra_text and len(full_payload) > 1024:
-            await message.reply_text(extra_text, parse_mode=ParseMode.HTML)
-    else:
-        await message.reply_text(full_payload, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
+        try:
+            await message.reply_photo(
+                photo=event_row["poster_file_id"],
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=reply_markup,
+            )
+            if extra_text and len(full_payload) > 1024:
+                await message.reply_text(extra_text, parse_mode=ParseMode.HTML)
+            return
+        except Exception as exc:
+            logger.warning("Could not send poster for event %s, falling back to text: %s", event_row.get("id"), exc)
+            if event_row.get("id"):
+                try:
+                    update_event_fields(event_row["id"], poster_file_id=None, poster_file_unique_id=None)
+                except Exception as inner_exc:
+                    logger.warning("Could not clear broken poster for event %s: %s", event_row.get("id"), inner_exc)
+
+    await message.reply_text(full_payload, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
 
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -1859,7 +1867,6 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         f"⏳ Бронь места действует до <b>{expires_text}</b>.\n\n"
         f"{build_payment_details_text(reg)}\n\n"
         "После перевода нажмите кнопку «Я оплатил».\n"
-        "Если передумали — нажмите «Отменить заявку»."
     )
     await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
@@ -2973,7 +2980,6 @@ async def promote_waiting_list_for_event(context: ContextTypes.DEFAULT_TYPE, eve
                     f"⏳ Бронь места действует до <b>{expires_text}</b>.\n\n"
                     f"{build_payment_details_text(reg)}\n\n"
                     "После перевода нажмите кнопку «Я оплатил».\n"
-                    "Если передумали — нажмите «Отменить заявку»."
                 ),
                 parse_mode=ParseMode.HTML,
                 reply_markup=keyboard,
