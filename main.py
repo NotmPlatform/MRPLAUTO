@@ -3239,12 +3239,18 @@ async def bridge_user_message_to_moderation(update: Update, context: ContextType
 
 
 async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = (update.message.text or "").strip()
+    message = update.effective_message
+    if not message:
+        return
+    if update.effective_chat and update.effective_chat.id == MODERATION_CHAT_ID:
+        return
+
+    text = (message.text or "").strip()
     if text in PARTICIPATE_BUTTONS | {PARTNER_BUTTON, "Мои данные", "Согласен", "Не согласен", "Да", "Нет", "Мужской", "Женский", "Мариуполь", "Другой город", SKIP_POSTER_TEXT, REMOVE_POSTER_TEXT, CANCEL_EDIT_TEXT}:
         return
     if await bridge_user_message_to_moderation(update, context):
         return
-    await update.message.reply_text("Используйте кнопки ниже: «Участвовать», «Партнерство» или «Мои данные».", reply_markup=main_menu_keyboard())
+    await message.reply_text("Используйте кнопки ниже: «Участвовать», «Партнерство» или «Мои данные».", reply_markup=main_menu_keyboard())
 
 
 def build_application() -> Application:
