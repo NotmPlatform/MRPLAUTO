@@ -102,7 +102,8 @@ LOCAL_TZ = ZoneInfo(TIMEZONE_LABEL)
     EVENT_POSTER,
     EDIT_EVENT_VALUE,
     EDIT_EVENT_POSTER,
-) = range(100, 114)
+    ADMIN_BROADCAST_CONFIRMED_MESSAGE,
+) = range(100, 115)
 
 ACTIVE_REGISTRATION_STATUSES = ("waiting_payment", "waiting_moderation", "approved")
 BLOCKING_REGISTRATION_STATUSES = ("waiting_payment", "waiting_moderation", "approved", "waiting_list")
@@ -120,6 +121,7 @@ STATUS_LABELS = {
     "approved": "подтверждена",
     "rejected": "отклонена",
     "cancelled": "отменена",
+    "cancelled_no_payment": "отменена: оплаты нет",
     "waiting_list": "лист ожидания",
     "expired": "истек таймер оплаты",
 }
@@ -295,6 +297,16 @@ def init_db() -> None:
             );
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS registration_message_links (
+                moderation_message_id BIGINT PRIMARY KEY,
+                registration_id BIGINT NOT NULL REFERENCES registrations(id) ON DELETE CASCADE,
+                message_role TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
 
         # Миграции для уже существующей БД
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS has_car BOOLEAN;")
@@ -318,6 +330,9 @@ def init_db() -> None:
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS payment_reminder_sent_at TIMESTAMPTZ;")
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS before_event_reminder_sent_at TIMESTAMPTZ;")
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS moderated_at TIMESTAMPTZ;")
+        cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS moderation_message_id BIGINT;")
+        cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS last_admin_message_id BIGINT;")
+        cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS admin_comment TEXT;")
 
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_reg_event_status ON registrations(event_id, status);"
@@ -342,6 +357,9 @@ def init_db() -> None:
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_partner_requests_status_created ON partner_requests(status, created_at DESC);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reg_msg_links_registration_created ON registration_message_links(registration_id, created_at DESC);"
         )
         cur.execute(
             """
@@ -759,6 +777,7 @@ def count_registrations_by_status(event_id: int) -> dict[str, int]:
         "approved",
         "rejected",
         "cancelled",
+        "cancelled_no_payment",
         "waiting_list",
         "expired",
     ]:
@@ -896,6 +915,69 @@ def get_registration(registration_id: int):
         return cur.fetchone()
 
 
+def set_registration_moderation_meta(
+    registration_id: int,
+    moderation_message_id: Optional[int] = None,
+    last_admin_message_id: Optional[int] = None,
+    admin_comment: Optional[str] = None,
+) -> None:
+    fields = {}
+    if moderation_message_id is not None:
+        fields['moderation_message_id'] = moderation_message_id
+    if last_admin_message_id is not None:
+        fields['last_admin_message_id'] = last_admin_message_id
+    if admin_comment is not None:
+        fields['admin_comment'] = admin_comment
+    if not fields:
+        return
+    assignments = ', '.join(f"{key} = %s" for key in fields.keys())
+    values = list(fields.values()) + [registration_id]
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(f"UPDATE registrations SET {assignments} WHERE id = %s", values)
+        conn.commit()
+
+
+def add_registration_message_link(registration_id: int, moderation_message_id: int, message_role: str) -> None:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO registration_message_links (moderation_message_id, registration_id, message_role)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (moderation_message_id) DO NOTHING
+            """,
+            (moderation_message_id, registration_id, message_role),
+        )
+        conn.commit()
+
+
+def get_registration_id_by_moderation_message_id(moderation_message_id: int) -> Optional[int]:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT registration_id FROM registration_message_links WHERE moderation_message_id = %s",
+            (moderation_message_id,),
+        )
+        row = cur.fetchone()
+        return int(row['registration_id']) if row else None
+
+
+def get_latest_contact_registration_for_user(telegram_id: int):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price, e.status AS event_status
+            FROM registrations r
+            JOIN events e ON e.id = r.event_id
+            WHERE r.telegram_id = %s
+              AND r.moderation_message_id IS NOT NULL
+              AND r.status IN ('waiting_payment', 'waiting_moderation', 'approved', 'cancelled', 'cancelled_no_payment', 'rejected')
+            ORDER BY r.created_at DESC, r.id DESC
+            LIMIT 1
+            """,
+            (telegram_id,),
+        )
+        return cur.fetchone()
+
+
 def get_waiting_list_for_event(event_id: int):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -939,7 +1021,7 @@ def update_registration_status(registration_id: int, status: str, payment_status
                         WHEN %s IN ('waiting_payment') THEN reservation_expires_at
                         ELSE NULL
                     END,
-                    moderated_at = CASE WHEN %s IN ('approved', 'rejected') THEN NOW() ELSE moderated_at END
+                    moderated_at = CASE WHEN %s IN ('approved', 'rejected', 'cancelled', 'cancelled_no_payment') THEN NOW() ELSE moderated_at END
                 WHERE id = %s
                 """,
                 (status, status, status, registration_id),
@@ -954,7 +1036,7 @@ def update_registration_status(registration_id: int, status: str, payment_status
                         WHEN %s IN ('waiting_payment') THEN reservation_expires_at
                         ELSE NULL
                     END,
-                    moderated_at = CASE WHEN %s IN ('approved', 'rejected') THEN NOW() ELSE moderated_at END
+                    moderated_at = CASE WHEN %s IN ('approved', 'rejected', 'cancelled', 'cancelled_no_payment') THEN NOW() ELSE moderated_at END
                 WHERE id = %s
                 """,
                 (status, payment_status, status, status, registration_id),
@@ -1116,7 +1198,7 @@ def build_event_stats_text(event_row) -> str:
     counts = count_registrations_by_status(event_row["id"])
     approved = counts["approved"]
     total_limit = max(int(event_row["total_limit"]), 1)
-    all_non_waitlist = approved + counts["waiting_payment"] + counts["waiting_moderation"] + counts["rejected"] + counts["cancelled"] + counts["expired"]
+    all_non_waitlist = approved + counts["waiting_payment"] + counts["waiting_moderation"] + counts["rejected"] + counts["cancelled"] + counts["cancelled_no_payment"] + counts["expired"]
     confirm_share = round((approved / total_limit) * 100, 1)
     approval_rate = round((approved / all_non_waitlist) * 100, 1) if all_non_waitlist else 0
     return (
@@ -1130,6 +1212,7 @@ def build_event_stats_text(event_row) -> str:
         f"Лист ожидания: {counts['waiting_list']}\n"
         f"Отклонено: {counts['rejected']}\n"
         f"Отменено: {counts['cancelled']}\n"
+        f"Отменено: нет оплаты: {counts['cancelled_no_payment']}\n"
         f"Истек таймер оплаты: {counts['expired']}"
     )
 
@@ -1248,7 +1331,7 @@ def build_active_event_keyboard(event_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Статистика", callback_data=f"stats:{event_id}"),
                 InlineKeyboardButton("Экспорт confirmed", callback_data=f"export:{event_id}"),
             ],
-            [InlineKeyboardButton("Напомнить confirmed", callback_data=f"notify_confirmed:{event_id}")],
+            [InlineKeyboardButton("Уведомить всех участников", callback_data=f"notify_confirmed:{event_id}")],
             [InlineKeyboardButton("Удалить мероприятие", callback_data=f"delete_event_prompt:{event_id}")],
         ]
     )
@@ -1781,7 +1864,11 @@ async def paid_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 [
                     InlineKeyboardButton("Подтвердить", callback_data=f"approve:{registration_id}"),
                     InlineKeyboardButton("Отклонить", callback_data=f"reject:{registration_id}"),
-                ]
+                ],
+                [
+                    InlineKeyboardButton("Нет оплаты", callback_data=f"cancel_nopay:{registration_id}"),
+                    InlineKeyboardButton("Отменить", callback_data=f"cancel_admin:{registration_id}"),
+                ],
             ]
         )
         mod_text = (
@@ -1798,12 +1885,14 @@ async def paid_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             + (f"Автомобиль: {human_has_car(reg.get('has_car_snapshot'))}\n" if reg.get('ask_has_car') else "")
             + f"Согласие ПД: {'Да' if reg['consent_snapshot'] else 'Нет'}"
         )
-        await context.bot.send_message(
+        sent_message = await context.bot.send_message(
             chat_id=MODERATION_CHAT_ID,
             text=mod_text,
             parse_mode=ParseMode.HTML,
             reply_markup=keyboard,
         )
+        set_registration_moderation_meta(registration_id, moderation_message_id=sent_message.message_id)
+        add_registration_message_link(registration_id, sent_message.message_id, 'root')
 
 
 async def cancel_registration_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1841,7 +1930,7 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.message.reply_text("Заявка не найдена.")
         return
     if reg["status"] != "waiting_moderation":
-        await query.message.reply_text(f"Эта заявка уже имеет статус: {reg['status']}")
+        await query.message.reply_text(f"Эта заявка уже имеет статус: {human_registration_status(reg['status'])}.")
         return
 
     if action == "approve":
@@ -1859,17 +1948,52 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             query.message.text_html + "\n\n✅ Подтверждено",
             parse_mode=ParseMode.HTML,
         )
-    elif action == "reject":
+        return
+
+    if action == "reject":
         update_registration_status(registration_id, "rejected", "rejected")
         await context.bot.send_message(
             chat_id=reg["telegram_id"],
-            text="К сожалению, заявка отклонена. Слот освобожден.",
+            text="К сожалению, заявка отклонена. Слот освобожден. Вы можете зайти снова и подать новую заявку.",
         )
         await query.edit_message_text(
             query.message.text_html + "\n\n❌ Отклонено",
             parse_mode=ParseMode.HTML,
         )
         await promote_waiting_list_for_event(context, reg["event_id"])
+        return
+
+    if action == "cancel_nopay":
+        update_registration_status(registration_id, "cancelled_no_payment", "not_paid")
+        await context.bot.send_message(
+            chat_id=reg["telegram_id"],
+            text=(
+                "Заявка отменена: оплата не найдена.\n\n"
+                "Если оплата не прошла или что-то не получилось, зайдите в бот снова и оформите новую заявку."
+            ),
+        )
+        await query.edit_message_text(
+            query.message.text_html + "\n\n⛔ Отменено: оплаты нет",
+            parse_mode=ParseMode.HTML,
+        )
+        await promote_waiting_list_for_event(context, reg["event_id"])
+        return
+
+    if action == "cancel_admin":
+        update_registration_status(registration_id, "cancelled", "cancelled")
+        await context.bot.send_message(
+            chat_id=reg["telegram_id"],
+            text=(
+                "Заявка отменена организатором.\n\n"
+                "Если захотите, зайдите в бот снова и оформите новую заявку."
+            ),
+        )
+        await query.edit_message_text(
+            query.message.text_html + "\n\n⛔ Отменено организатором",
+            parse_mode=ParseMode.HTML,
+        )
+        await promote_waiting_list_for_event(context, reg["event_id"])
+        return
 
 
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2535,33 +2659,91 @@ async def admin_export_callback(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-async def admin_notify_confirmed_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def admin_notify_confirmed_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if not is_admin(query.from_user.id):
         await query.message.reply_text("У вас нет доступа.")
-        return
+        return ConversationHandler.END
+
     event_id = int(query.data.split(":", 1)[1])
+    event_row = get_event(event_id)
+    if not event_row:
+        await query.message.reply_text("Мероприятие не найдено.")
+        return ConversationHandler.END
+
     approved_rows = get_approved_registrations_for_event(event_id)
     if not approved_rows:
         await query.message.reply_text("Нет подтвержденных участников.")
-        return
+        return ConversationHandler.END
+
+    context.user_data["broadcast_confirmed_event_id"] = event_id
+    context.user_data["broadcast_confirmed_event_title"] = event_row["title"]
+    await query.message.reply_text(
+        (
+            f"Введите сообщение для всех подтвержденных участников мероприятия «{event_row['title']}».\n\n"
+            "Бот отправит его всем участникам со статусом approved.\n"
+            "Чтобы отменить рассылку, нажмите «Отмена»."
+        ),
+        reply_markup=ReplyKeyboardMarkup([[CANCEL_EDIT_TEXT]], resize_keyboard=True, one_time_keyboard=True),
+    )
+    return ADMIN_BROADCAST_CONFIRMED_MESSAGE
+
+
+async def admin_broadcast_confirmed_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    event_id = context.user_data.get("broadcast_confirmed_event_id")
+    event_title = context.user_data.get("broadcast_confirmed_event_title", "мероприятия")
+    if not event_id:
+        await update.message.reply_text("Нет активной рассылки.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+
+    text_value = (update.message.text or "").strip()
+    if text_value == CANCEL_EDIT_TEXT:
+        context.user_data.pop("broadcast_confirmed_event_id", None)
+        context.user_data.pop("broadcast_confirmed_event_title", None)
+        await update.message.reply_text("Рассылка отменена.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+
+    if len(text_value) < 2:
+        await update.message.reply_text("Введите текст сообщения или нажмите «Отмена».")
+        return ADMIN_BROADCAST_CONFIRMED_MESSAGE
+
+    approved_rows = get_approved_registrations_for_event(event_id)
+    if not approved_rows:
+        context.user_data.pop("broadcast_confirmed_event_id", None)
+        context.user_data.pop("broadcast_confirmed_event_title", None)
+        await update.message.reply_text("Нет подтвержденных участников для рассылки.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+
     sent = 0
+    failed = 0
+    payload = (
+        f"<b>Сообщение от организатора</b>\n"
+        f"Мероприятие: <b>{html.escape(str(event_title))}</b>\n\n"
+        f"{html.escape(text_value)}"
+    )
     for row in approved_rows:
         try:
             await context.bot.send_message(
                 chat_id=row["telegram_id"],
-                text=(
-                    f"Напоминание от организатора 📌\n\n"
-                    f"Мероприятие: {row['title']}\n"
-                    f"Дата: {row['event_date']} {row['event_time']}\n"
-                    f"Место: {row['location']}"
-                ),
+                text=payload,
+                parse_mode=ParseMode.HTML,
             )
             sent += 1
         except Exception as exc:
-            logger.warning("Could not notify approved participant %s: %s", row["telegram_id"], exc)
-    await query.message.reply_text(f"Напоминание отправлено: {sent} участникам.")
+            failed += 1
+            logger.warning("Could not broadcast to approved participant %s: %s", row["telegram_id"], exc)
+
+    context.user_data.pop("broadcast_confirmed_event_id", None)
+    context.user_data.pop("broadcast_confirmed_event_title", None)
+    await update.message.reply_text(
+        f"Готово. Сообщение отправлено {sent} участникам. Не доставлено: {failed}.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ConversationHandler.END
 
 
 async def promote_waiting_list_for_event(context: ContextTypes.DEFAULT_TYPE, event_id: int) -> None:
@@ -2657,9 +2839,91 @@ async def background_maintenance(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("Background maintenance failed: %s", exc)
 
 
+async def moderation_admin_reply_bridge(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if not message or not message.reply_to_message:
+        return
+    if update.effective_chat.id != MODERATION_CHAT_ID or not is_admin(update.effective_user.id):
+        return
+
+    registration_id = get_registration_id_by_moderation_message_id(message.reply_to_message.message_id)
+    if not registration_id:
+        return
+
+    reg = get_registration(registration_id)
+    if not reg:
+        return
+
+    admin_text = (message.text or "").strip()
+    if not admin_text:
+        return
+
+    await context.bot.send_message(
+        chat_id=reg['telegram_id'],
+        text=(
+            f"Сообщение по вашей заявке на «{reg['title']}»\n\n"
+            f"{admin_text}\n\n"
+            "Вы можете ответить просто сообщением в этот чат."
+        ),
+    )
+    set_registration_moderation_meta(
+        registration_id,
+        last_admin_message_id=message.message_id,
+        admin_comment=admin_text,
+    )
+    add_registration_message_link(registration_id, message.message_id, 'admin')
+
+
+async def bridge_user_message_to_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    message = update.effective_message
+    if not message or update.effective_chat.id == MODERATION_CHAT_ID:
+        return False
+    if update.effective_chat.type != 'private':
+        return False
+
+    text = (message.text or '').strip()
+    if not text:
+        return False
+    if text in PARTICIPATE_BUTTONS | {PARTNER_BUTTON, 'Мои данные', 'Согласен', 'Не согласен', 'Да', 'Нет', 'Мужской', 'Женский', 'Мариуполь', 'Другой город', SKIP_POSTER_TEXT, REMOVE_POSTER_TEXT, CANCEL_EDIT_TEXT}:
+        return False
+    if not MODERATION_CHAT_ID:
+        return False
+
+    reg = get_latest_contact_registration_for_user(update.effective_user.id)
+    if not reg:
+        return False
+
+    reply_to_message_id = reg.get('last_admin_message_id') or reg.get('moderation_message_id')
+    if not reply_to_message_id:
+        return False
+
+    user_name = html.escape(update.effective_user.full_name or reg.get('name_snapshot') or 'Участник')
+    username_line = f"\nUsername: @{html.escape(update.effective_user.username)}" if update.effective_user.username else ''
+    sent_message = await context.bot.send_message(
+        chat_id=MODERATION_CHAT_ID,
+        reply_to_message_id=reply_to_message_id,
+        parse_mode=ParseMode.HTML,
+        text=(
+            f"<b>Ответ участника</b>\n"
+            f"Заявка ID: {reg['id']}\n"
+            f"Код оплаты: {html.escape(str(reg.get('payment_code') or '—'))}\n"
+            f"Имя: {user_name}{username_line}\n\n"
+            f"{html.escape(text)}"
+        ),
+    )
+    add_registration_message_link(reg['id'], sent_message.message_id, 'user')
+    await message.reply_text(
+        "Сообщение отправлено организатору. Когда будет ответ, бот пришлет его сюда.",
+        reply_markup=main_menu_keyboard(),
+    )
+    return True
+
+
 async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
     if text in PARTICIPATE_BUTTONS | {PARTNER_BUTTON, "Мои данные", "Согласен", "Не согласен", "Да", "Нет", "Мужской", "Женский", "Мариуполь", "Другой город", SKIP_POSTER_TEXT, REMOVE_POSTER_TEXT, CANCEL_EDIT_TEXT}:
+        return
+    if await bridge_user_message_to_moderation(update, context):
         return
     await update.message.reply_text("Используйте кнопки ниже: «Участвовать», «Партнерство» или «Мои данные».", reply_markup=main_menu_keyboard())
 
@@ -2733,6 +2997,18 @@ def build_application() -> Application:
         per_user=True,
     )
 
+    notify_confirmed_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_notify_confirmed_callback, pattern=r"^notify_confirmed:")],
+        states={
+            ADMIN_BROADCAST_CONFIRMED_MESSAGE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_confirmed_message)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", admin_cancel_event_creation)],
+        per_chat=True,
+        per_user=True,
+    )
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_menu))
     application.add_handler(MessageHandler(filters.Regex(r"^Мои данные$"), show_profile))
@@ -2740,11 +3016,12 @@ def build_application() -> Application:
     application.add_handler(partner_conv)
     application.add_handler(event_conv)
     application.add_handler(edit_event_conv)
+    application.add_handler(notify_confirmed_conv)
     application.add_handler(CallbackQueryHandler(pay_callback, pattern=r"^pay:"))
     application.add_handler(CallbackQueryHandler(join_waiting_list_callback, pattern=r"^join_waitlist:"))
     application.add_handler(CallbackQueryHandler(paid_callback, pattern=r"^paid:"))
     application.add_handler(CallbackQueryHandler(cancel_registration_callback, pattern=r"^cancel_reg:"))
-    application.add_handler(CallbackQueryHandler(moderation_callback, pattern=r"^(approve|reject):"))
+    application.add_handler(CallbackQueryHandler(moderation_callback, pattern=r"^(approve|reject|cancel_nopay|cancel_admin):"))
     application.add_handler(CallbackQueryHandler(admin_list_events, pattern=r"^admin_list_events$"))
     application.add_handler(CallbackQueryHandler(admin_show_active_event, pattern=r"^admin_active_event$"))
     application.add_handler(CallbackQueryHandler(admin_edit_current_event, pattern=r"^admin_edit_current_event$"))
@@ -2755,7 +3032,7 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(admin_delete_event_cancel, pattern=r"^delete_event_cancel:"))
     application.add_handler(CallbackQueryHandler(admin_stats_callback, pattern=r"^stats:"))
     application.add_handler(CallbackQueryHandler(admin_export_callback, pattern=r"^export:"))
-    application.add_handler(CallbackQueryHandler(admin_notify_confirmed_callback, pattern=r"^notify_confirmed:"))
+    application.add_handler(MessageHandler(filters.Chat(MODERATION_CHAT_ID) & filters.TEXT & ~filters.COMMAND, moderation_admin_reply_bridge))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_text))
 
     return application
