@@ -588,6 +588,12 @@ def set_event_status(event_id: int, new_status: str) -> None:
         conn.commit()
 
 
+def delete_event(event_id: int) -> None:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute("DELETE FROM events WHERE id = %s", (event_id,))
+        conn.commit()
+
+
 def get_latest_registration_for_user_event(telegram_id: int, event_id: int):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -1018,10 +1024,12 @@ def render_partner_request_text(partner_id: int, data: dict) -> str:
     )
 
 
-def build_edit_event_keyboard(event_id: int) -> InlineKeyboardMarkup:
+def build_edit_event_keyboard(event_row) -> InlineKeyboardMarkup:
+    event_id = event_row["id"]
+    poster_label = "Редактировать афишу" if event_row.get("poster_file_id") else "Добавить афишу"
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Редактировать афишу", callback_data=f"edit_event_field:poster:{event_id}")],
+            [InlineKeyboardButton(poster_label, callback_data=f"edit_event_field:poster:{event_id}")],
             [
                 InlineKeyboardButton("Название", callback_data=f"edit_event_field:title:{event_id}"),
                 InlineKeyboardButton("Дата", callback_data=f"edit_event_field:event_date:{event_id}"),
@@ -1042,6 +1050,7 @@ def build_edit_event_keyboard(event_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Макс. возраст", callback_data=f"edit_event_field:max_age:{event_id}"),
                 InlineKeyboardButton("Вопрос про авто", callback_data=f"edit_event_field:ask_has_car:{event_id}"),
             ],
+            [InlineKeyboardButton("Удалить мероприятие", callback_data=f"delete_event_prompt:{event_id}")],
         ]
     )
 
@@ -1117,6 +1126,7 @@ def build_active_event_keyboard(event_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Экспорт confirmed", callback_data=f"export:{event_id}"),
             ],
             [InlineKeyboardButton("Напомнить confirmed", callback_data=f"notify_confirmed:{event_id}")],
+            [InlineKeyboardButton("Удалить мероприятие", callback_data=f"delete_event_prompt:{event_id}")],
         ]
     )
 
@@ -1775,8 +1785,56 @@ async def admin_edit_current_event(update: Update, context: ContextTypes.DEFAULT
         event_row,
         public=False,
         intro="Редактирование текущего мероприятия:",
-        reply_markup=build_edit_event_keyboard(event_row["id"]),
+        reply_markup=build_edit_event_keyboard(event_row),
     )
+
+
+async def admin_delete_event_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text("У вас нет доступа.")
+        return
+    event_id = int(query.data.split(":", 1)[1])
+    event_row = get_event(event_id)
+    if not event_row:
+        await query.message.reply_text("Мероприятие не найдено.")
+        return
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Да, удалить", callback_data=f"delete_event_confirm:{event_id}"),
+                InlineKeyboardButton("Отмена", callback_data=f"delete_event_cancel:{event_id}"),
+            ]
+        ]
+    )
+    await query.message.reply_text(
+        f"Удалить мероприятие <b>{html.escape(event_row['title'])}</b>?\n\nЭто удалит само мероприятие, заявки и связанные данные по нему.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
+async def admin_delete_event_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text("У вас нет доступа.")
+        return
+    event_id = int(query.data.split(":", 1)[1])
+    event_row = get_event(event_id)
+    if not event_row:
+        await query.message.reply_text("Мероприятие уже удалено.")
+        return
+    title = event_row["title"]
+    delete_event(event_id)
+    await query.message.reply_text(f"Мероприятие «{title}» удалено.")
+
+
+async def admin_delete_event_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer("Удаление отменено")
+    await query.message.reply_text("Удаление мероприятия отменено.")
 
 
 async def admin_add_event_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2033,7 +2091,7 @@ async def admin_edit_event_menu(update: Update, context: ContextTypes.DEFAULT_TY
         event_row,
         public=False,
         intro="Выберите, что хотите изменить:",
-        reply_markup=build_edit_event_keyboard(event_id),
+        reply_markup=build_edit_event_keyboard(event_row),
     )
 
 
@@ -2072,8 +2130,9 @@ async def admin_edit_field_entry(update: Update, context: ContextTypes.DEFAULT_T
             resize_keyboard=True,
             one_time_keyboard=True,
         )
+        poster_prompt = "Отправьте новую афишу одним фото. Или выберите действие ниже." if event_row.get("poster_file_id") else "Отправьте афишу одним фото. Или выберите действие ниже."
         await query.message.reply_text(
-            "Отправьте новую афишу одним фото. Или выберите действие ниже.",
+            poster_prompt,
             reply_markup=keyboard,
         )
         return EDIT_EVENT_POSTER
@@ -2553,6 +2612,9 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(admin_edit_current_event, pattern=r"^admin_edit_current_event$"))
     application.add_handler(CallbackQueryHandler(admin_edit_event_menu, pattern=r"^edit_event_menu:"))
     application.add_handler(CallbackQueryHandler(admin_event_status_callback, pattern=r"^(activate|close):"))
+    application.add_handler(CallbackQueryHandler(admin_delete_event_prompt, pattern=r"^delete_event_prompt:"))
+    application.add_handler(CallbackQueryHandler(admin_delete_event_confirm, pattern=r"^delete_event_confirm:"))
+    application.add_handler(CallbackQueryHandler(admin_delete_event_cancel, pattern=r"^delete_event_cancel:"))
     application.add_handler(CallbackQueryHandler(admin_stats_callback, pattern=r"^stats:"))
     application.add_handler(CallbackQueryHandler(admin_export_callback, pattern=r"^export:"))
     application.add_handler(CallbackQueryHandler(admin_notify_confirmed_callback, pattern=r"^notify_confirmed:"))
