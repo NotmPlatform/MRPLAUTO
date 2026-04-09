@@ -53,6 +53,8 @@ PAYMENT_TEXT = os.getenv(
     "PAYMENT_TEXT",
     "Оплатите участие по вашим реквизитам. После оплаты нажмите кнопку «Я оплатил».",
 )
+SBP_PHONE = os.getenv("SBP_PHONE", "+79262326715")
+SBP_RECEIVER = os.getenv("SBP_RECEIVER", "Баранцев А.М.")
 TIMEZONE_LABEL = os.getenv("TIMEZONE_LABEL", "Europe/Moscow")
 PAYMENT_TIMEOUT_MINUTES = int(os.getenv("PAYMENT_TIMEOUT_MINUTES", "30"))
 PAYMENT_REMINDER_BEFORE_MINUTES = int(os.getenv("PAYMENT_REMINDER_BEFORE_MINUTES", "15"))
@@ -127,8 +129,8 @@ EVENT_STATUS_LABELS = {
 }
 PARTICIPATE_BUTTONS = {"Участвовать", "Хочу участвовать"}
 PARTNER_BUTTON = "Партнерство"
-SKIP_POSTER_TEXT = "Пропустить фото"
-REMOVE_POSTER_TEXT = "Удалить фото"
+SKIP_POSTER_TEXT = "Пропустить афишу"
+REMOVE_POSTER_TEXT = "Удалить афишу"
 CANCEL_EDIT_TEXT = "Отмена"
 YES_NO_KEYBOARD = [["Да", "Нет"]]
 
@@ -378,6 +380,14 @@ def human_has_car(value) -> str:
     if value is False:
         return "Нет"
     return "Не указано"
+
+
+def build_payment_details_text(registration_id: int) -> str:
+    return (
+        f"Оплата по СБП по номеру телефона:\n<code>{html.escape(SBP_PHONE)}</code>\n\n"
+        f"Получатель: {html.escape(SBP_RECEIVER)}\n\n"
+        f"В комментарии к переводу укажите ID заявки:\n<code>{registration_id}</code>"
+    )
 
 
 def should_ask_car_question(event_row, user_row) -> bool:
@@ -1026,7 +1036,7 @@ def render_partner_request_text(partner_id: int, data: dict) -> str:
 
 def build_edit_event_keyboard(event_row) -> InlineKeyboardMarkup:
     event_id = event_row["id"]
-    poster_label = "Редактировать фото" if event_row.get("poster_file_id") else "Добавить фото"
+    poster_label = "Редактировать афишу" if event_row.get("poster_file_id") else "Добавить афишу"
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton(poster_label, callback_data=f"edit_event_field:poster:{event_id}")],
@@ -1572,9 +1582,11 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     text = (
         f"Заявка создана на мероприятие <b>{html.escape(event_row['title'])}</b>.\n\n"
+        f"ID заявки: <code>{registration_id}</code>\n\n"
         f"⏳ Место забронировано за вами на {PAYMENT_TIMEOUT_MINUTES} минут — до {expires_text}.\n\n"
-        f"{html.escape(PAYMENT_TEXT)}\n\n"
-        "После оплаты нажмите кнопку «Я оплатил»."
+        f"{build_payment_details_text(registration_id)}\n\n"
+        + (f"{html.escape(PAYMENT_TEXT)}\n\n" if PAYMENT_TEXT else "")
+        + "После оплаты нажмите кнопку «Я оплатил»."
     )
     await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
@@ -1995,7 +2007,7 @@ async def admin_event_car_question(update: Update, context: ContextTypes.DEFAULT
     data["ask_has_car"] = enabled
     keyboard = ReplyKeyboardMarkup([[SKIP_POSTER_TEXT]], resize_keyboard=True, one_time_keyboard=True)
     await query.message.reply_text(
-        "Теперь отправьте афишу одним фото. Если пока без афиши — нажмите «Пропустить».",
+        "Теперь отправьте афишу одним фото. Если пока без афиши — нажмите «Пропустить афишу».",
         reply_markup=keyboard,
     )
     return EVENT_POSTER
@@ -2014,7 +2026,7 @@ async def admin_event_poster(update: Update, context: ContextTypes.DEFAULT_TYPE)
         text_value = (update.message.text or "").strip()
         if text_value != SKIP_POSTER_TEXT:
             await update.message.reply_text(
-                "Отправьте одно фото афиши или нажмите «Пропустить фото».",
+                "Отправьте одно фото афиши или нажмите «Пропустить афишу».",
                 reply_markup=ReplyKeyboardMarkup([[SKIP_POSTER_TEXT]], resize_keyboard=True, one_time_keyboard=True),
             )
             return EVENT_POSTER
@@ -2278,7 +2290,7 @@ async def admin_edit_event_poster(update: Update, context: ContextTypes.DEFAULT_
             return ConversationHandler.END
         else:
             await update.message.reply_text(
-                "Отправьте одно фото, либо выберите «Удалить фото» или «Отмена»."
+                "Отправьте одно фото, либо выберите «Удалить афишу» или «Отмена»."
             )
             return EDIT_EVENT_POSTER
 
@@ -2455,9 +2467,11 @@ async def promote_waiting_list_for_event(context: ContextTypes.DEFAULT_TYPE, eve
                 chat_id=row["telegram_id"],
                 text=(
                     f"Освободилось место на <b>{html.escape(row['title'])}</b> ✅\n\n"
+                    f"ID заявки: <code>{row['id']}</code>\n\n"
                     f"Вы были в листе ожидания и автоматически переведены в этап оплаты.\n"
                     f"⏳ Место держится до {expires_text}.\n\n"
-                    f"{html.escape(PAYMENT_TEXT)}"
+                    f"{build_payment_details_text(row['id'])}\n\n"
+                    + (f"{html.escape(PAYMENT_TEXT)}" if PAYMENT_TEXT else "")
                 ),
                 parse_mode=ParseMode.HTML,
                 reply_markup=keyboard,
