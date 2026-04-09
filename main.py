@@ -1,16 +1,27 @@
+# -*- coding: utf-8 -*-
+import csv
 import html
+import io
 import logging
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from io import BytesIO
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import psycopg
 from fastapi import FastAPI, HTTPException, Request
+from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram import (
+    BufferedInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -34,7 +45,6 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 PORT = int(os.getenv("PORT", "8080"))
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 MODERATION_CHAT_ID = int(os.getenv("MODERATION_CHAT_ID", "0"))
-PARTNERSHIP_CHAT_ID = int(os.getenv("PARTNERSHIP_CHAT_ID", str(MODERATION_CHAT_ID or 0)))
 ADMIN_USER_IDS = {
     int(x.strip())
     for x in os.getenv("ADMIN_USER_IDS", "").split(",")
@@ -45,6 +55,10 @@ PAYMENT_TEXT = os.getenv(
     "Оплатите участие по вашим реквизитам. После оплаты нажмите кнопку «Я оплатил».",
 )
 TIMEZONE_LABEL = os.getenv("TIMEZONE_LABEL", "Europe/Moscow")
+PAYMENT_TIMEOUT_MINUTES = int(os.getenv("PAYMENT_TIMEOUT_MINUTES", "30"))
+PAYMENT_REMINDER_BEFORE_MINUTES = int(os.getenv("PAYMENT_REMINDER_BEFORE_MINUTES", "15"))
+EVENT_REMINDER_BEFORE_HOURS = int(os.getenv("EVENT_REMINDER_BEFORE_HOURS", "24"))
+BACKGROUND_CHECK_INTERVAL_SECONDS = int(os.getenv("BACKGROUND_CHECK_INTERVAL_SECONDS", "300"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
@@ -55,12 +69,31 @@ if not WEBHOOK_SECRET:
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is required")
 
-PROFILE_NAME, PROFILE_AGE, PROFILE_GENDER, PROFILE_CITY, PROFILE_PHONE = range(5)
-PARTNER_PROPOSAL, PARTNER_PHONE = range(20, 22)
-EVENT_TITLE, EVENT_DATE, EVENT_TIME, EVENT_LOCATION, EVENT_PRICE, EVENT_DESCRIPTION, EVENT_PHOTO, EVENT_LIMIT, EVENT_BALANCE = range(100, 109)
-EDIT_EVENT_VALUE = 150
+LOCAL_TZ = ZoneInfo(TIMEZONE_LABEL)
+
+(
+    PROFILE_NAME,
+    PROFILE_AGE,
+    PROFILE_GENDER,
+    PROFILE_CITY,
+    PROFILE_PHONE,
+    PROFILE_CONSENT,
+) = range(6)
+(
+    EVENT_TITLE,
+    EVENT_DATE,
+    EVENT_TIME,
+    EVENT_LOCATION,
+    EVENT_PRICE,
+    EVENT_DESCRIPTION,
+    EVENT_LIMIT,
+    EVENT_MIN_AGE,
+    EVENT_MAX_AGE,
+    EVENT_BALANCE,
+) = range(100, 110)
 
 ACTIVE_REGISTRATION_STATUSES = ("waiting_payment", "waiting_moderation", "approved")
+BLOCKING_REGISTRATION_STATUSES = ("waiting_payment", "waiting_moderation", "approved", "waiting_list")
 GENDER_MAP = {
     "Мужской": "male",
     "Женский": "female",
@@ -69,18 +102,33 @@ GENDER_LABELS = {
     "male": "Мужской",
     "female": "Женский",
 }
-SHORT_GENDER = {
-    "male": "М",
-    "female": "Ж",
+STATUS_LABELS = {
+    "waiting_payment": "ожидает оплаты",
+    "waiting_moderation": "на модерации",
+    "approved": "подтверждена",
+    "rejected": "отклонена",
+    "cancelled": "отменена",
+    "waiting_list": "лист ожидания",
+    "expired": "истек таймер оплаты",
+}
+EVENT_STATUS_LABELS = {
+    "draft": "Черновик",
+    "upcoming": "Скоро",
+    "active": "Активно",
+    "closed": "Набор закрыт",
 }
 
 
-# =========================
-# DB
-# =========================
+class DuplicateRegistrationError(Exception):
+    pass
+
 
 def get_conn():
     return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+
+def now_local() -> datetime:
+    return datetime.now(LOCAL_TZ)
 
 
 def init_db() -> None:
@@ -95,6 +143,8 @@ def init_db() -> None:
                 gender TEXT,
                 city TEXT,
                 phone TEXT,
+                consent_personal_data BOOLEAN NOT NULL DEFAULT FALSE,
+                consent_at TIMESTAMPTZ,
                 profile_completed BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -111,8 +161,9 @@ def init_db() -> None:
                 location TEXT NOT NULL,
                 price NUMERIC(10, 2) NOT NULL DEFAULT 0,
                 description TEXT,
-                event_photo_file_id TEXT,
                 total_limit INTEGER NOT NULL,
+                min_age INTEGER NOT NULL DEFAULT 18,
+                max_age INTEGER NOT NULL DEFAULT 99,
                 gender_balance_enabled BOOLEAN NOT NULL DEFAULT FALSE,
                 male_limit INTEGER,
                 female_limit INTEGER,
@@ -121,7 +172,6 @@ def init_db() -> None:
             );
             """
         )
-        cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS event_photo_file_id TEXT;")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS registrations (
@@ -133,18 +183,50 @@ def init_db() -> None:
                 gender_snapshot TEXT NOT NULL,
                 city_snapshot TEXT NOT NULL,
                 phone_snapshot TEXT NOT NULL,
+                consent_snapshot BOOLEAN NOT NULL DEFAULT FALSE,
                 status TEXT NOT NULL DEFAULT 'waiting_payment',
                 payment_status TEXT NOT NULL DEFAULT 'not_paid',
+                reservation_expires_at TIMESTAMPTZ,
+                payment_reminder_sent_at TIMESTAMPTZ,
+                before_event_reminder_sent_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 moderated_at TIMESTAMPTZ
             );
             """
         )
+
+        # Миграции для уже существующей БД
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS consent_personal_data BOOLEAN NOT NULL DEFAULT FALSE;")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS consent_at TIMESTAMPTZ;")
+
+        cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS min_age INTEGER NOT NULL DEFAULT 18;")
+        cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS max_age INTEGER NOT NULL DEFAULT 99;")
+        cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS gender_balance_enabled BOOLEAN NOT NULL DEFAULT FALSE;")
+        cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS male_limit INTEGER;")
+        cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS female_limit INTEGER;")
+        cur.execute("ALTER TABLE events ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'draft';")
+
+        cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS consent_snapshot BOOLEAN NOT NULL DEFAULT FALSE;")
+        cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS reservation_expires_at TIMESTAMPTZ;")
+        cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS payment_reminder_sent_at TIMESTAMPTZ;")
+        cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS before_event_reminder_sent_at TIMESTAMPTZ;")
+        cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS moderated_at TIMESTAMPTZ;")
+
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_reg_event_status ON registrations(event_id, status);"
         )
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_reg_tg_event ON registrations(telegram_id, event_id);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_reg_reservation_expires ON registrations(reservation_expires_at);"
+        )
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uniq_reg_one_active_per_user_event
+            ON registrations(event_id, telegram_id)
+            WHERE status IN ('waiting_payment', 'waiting_moderation', 'approved', 'waiting_list');
+            """
         )
         conn.commit()
 
@@ -153,16 +235,72 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_USER_IDS
 
 
-# =========================
-# USERS
-# =========================
+def normalize_phone(raw_phone: str) -> Optional[str]:
+    phone = (raw_phone or "").strip().replace(" ", "")
+    digits = re.sub(r"\D", "", phone)
+    if len(digits) < 10 or len(digits) > 15:
+        return None
+    if phone.startswith("8") and len(digits) == 11:
+        return "+7" + digits[1:]
+    if phone.startswith("+"):
+        return "+" + digits
+    return "+" + digits
 
-def upsert_user_profile(telegram_id: int, username: Optional[str], full_name: str, age: int, gender: str, city: str, phone: str) -> None:
+
+def parse_event_datetime(event_date_value, event_time_value: str) -> Optional[datetime]:
+    if event_date_value is None:
+        return None
+    date_str = str(event_date_value)
+    time_raw = (event_time_value or "").strip()
+    match = re.search(r"(\d{1,2}):(\d{2})", time_raw)
+    if not match:
+        logger.warning("Could not parse event time: %s", time_raw)
+        return None
+    hours = int(match.group(1))
+    minutes = int(match.group(2))
+    try:
+        return datetime.strptime(f"{date_str} {hours:02d}:{minutes:02d}", "%Y-%m-%d %H:%M").replace(tzinfo=LOCAL_TZ)
+    except ValueError:
+        logger.warning("Invalid event datetime: %s %s", date_str, time_raw)
+        return None
+
+
+def format_price(value) -> str:
+    if value is None:
+        return "0"
+    if isinstance(value, Decimal):
+        if value == value.to_integral():
+            return str(int(value))
+        return str(value)
+    return str(value)
+
+
+def human_event_status(status: str) -> str:
+    return EVENT_STATUS_LABELS.get(status, status)
+
+
+def human_registration_status(status: str) -> str:
+    return STATUS_LABELS.get(status, status)
+
+
+def upsert_user_profile(
+    telegram_id: int,
+    username: Optional[str],
+    full_name: str,
+    age: int,
+    gender: str,
+    city: str,
+    phone: str,
+    consent_personal_data: bool,
+) -> None:
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            INSERT INTO users (telegram_id, username, full_name, age, gender, city, phone, profile_completed)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
+            INSERT INTO users (
+                telegram_id, username, full_name, age, gender, city, phone,
+                consent_personal_data, consent_at, profile_completed
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CASE WHEN %s THEN NOW() ELSE NULL END, TRUE)
             ON CONFLICT (telegram_id)
             DO UPDATE SET
                 username = EXCLUDED.username,
@@ -171,10 +309,25 @@ def upsert_user_profile(telegram_id: int, username: Optional[str], full_name: st
                 gender = EXCLUDED.gender,
                 city = EXCLUDED.city,
                 phone = EXCLUDED.phone,
+                consent_personal_data = EXCLUDED.consent_personal_data,
+                consent_at = CASE
+                    WHEN EXCLUDED.consent_personal_data THEN NOW()
+                    ELSE users.consent_at
+                END,
                 profile_completed = TRUE,
                 updated_at = NOW();
             """,
-            (telegram_id, username, full_name, age, gender, city, phone),
+            (
+                telegram_id,
+                username,
+                full_name,
+                age,
+                gender,
+                city,
+                phone,
+                consent_personal_data,
+                consent_personal_data,
+            ),
         )
         conn.commit()
 
@@ -185,10 +338,6 @@ def get_user_profile(telegram_id: int):
         return cur.fetchone()
 
 
-# =========================
-# EVENTS
-# =========================
-
 def create_event(
     title: str,
     event_date: str,
@@ -196,8 +345,9 @@ def create_event(
     location: str,
     price: Decimal,
     description: str,
-    event_photo_file_id: Optional[str],
     total_limit: int,
+    min_age: int,
+    max_age: int,
     gender_balance_enabled: bool,
 ) -> int:
     male_limit = female_limit = None
@@ -208,11 +358,10 @@ def create_event(
         cur.execute(
             """
             INSERT INTO events (
-                title, event_date, event_time, location, price, description,
-                event_photo_file_id, total_limit, gender_balance_enabled,
-                male_limit, female_limit, status
+                title, event_date, event_time, location, price, description, total_limit,
+                min_age, max_age, gender_balance_enabled, male_limit, female_limit, status
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'upcoming')
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'upcoming')
             RETURNING id;
             """,
             (
@@ -222,8 +371,9 @@ def create_event(
                 location,
                 price,
                 description,
-                event_photo_file_id,
                 total_limit,
+                min_age,
+                max_age,
                 gender_balance_enabled,
                 male_limit,
                 female_limit,
@@ -234,13 +384,13 @@ def create_event(
         return event_id
 
 
-def list_events(limit: int = 30):
+def list_events(limit: int = 20):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
             SELECT *
             FROM events
-            ORDER BY event_date ASC, created_at ASC
+            ORDER BY CASE WHEN status = 'active' THEN 0 ELSE 1 END, event_date ASC, created_at ASC
             LIMIT %s
             """,
             (limit,),
@@ -276,60 +426,6 @@ def set_event_status(event_id: int, new_status: str) -> None:
         conn.commit()
 
 
-def update_event_field(event_id: int, field_name: str, value) -> None:
-    allowed = {
-        "title",
-        "event_date",
-        "event_time",
-        "location",
-        "price",
-        "description",
-        "event_photo_file_id",
-        "total_limit",
-        "gender_balance_enabled",
-        "male_limit",
-        "female_limit",
-    }
-    if field_name not in allowed:
-        raise ValueError("Unsupported field")
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(f"UPDATE events SET {field_name} = %s WHERE id = %s", (value, event_id))
-        conn.commit()
-
-
-def update_event_limit_and_balance(event_id: int, total_limit: int) -> tuple[bool, str]:
-    event_row = get_event(event_id)
-    if not event_row:
-        return False, "Мероприятие не найдено."
-
-    active_total = count_active_registrations(event_id)
-    if total_limit < active_total:
-        return False, f"Лимит нельзя сделать меньше, чем уже занято слотов: {active_total}."
-
-    male_limit = female_limit = None
-    if event_row["gender_balance_enabled"]:
-        if total_limit % 2 != 0:
-            return False, "Для режима 50/50 общий лимит должен быть четным."
-        male_active = count_active_registrations_by_gender(event_id, "male")
-        female_active = count_active_registrations_by_gender(event_id, "female")
-        male_limit = total_limit // 2
-        female_limit = total_limit // 2
-        if male_active > male_limit or female_active > female_limit:
-            return False, "Новый лимит меньше уже занятых мест по полу."
-
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            "UPDATE events SET total_limit=%s, male_limit=%s, female_limit=%s WHERE id=%s",
-            (total_limit, male_limit, female_limit, event_id),
-        )
-        conn.commit()
-    return True, "Лимит обновлен."
-
-
-# =========================
-# REGISTRATIONS / STATS
-# =========================
-
 def get_latest_registration_for_user_event(telegram_id: int, event_id: int):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -343,6 +439,49 @@ def get_latest_registration_for_user_event(telegram_id: int, event_id: int):
             (telegram_id, event_id),
         )
         return cur.fetchone()
+
+
+def get_blocking_registration_for_user_event(telegram_id: int, event_id: int):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT *
+            FROM registrations
+            WHERE telegram_id = %s
+              AND event_id = %s
+              AND status IN ('waiting_payment', 'waiting_moderation', 'approved', 'waiting_list')
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            """,
+            (telegram_id, event_id),
+        )
+        return cur.fetchone()
+
+
+def count_registrations_by_status(event_id: int) -> dict[str, int]:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT status, COUNT(*) AS cnt
+            FROM registrations
+            WHERE event_id = %s
+            GROUP BY status
+            """,
+            (event_id,),
+        )
+        rows = cur.fetchall()
+    data = {row["status"]: int(row["cnt"]) for row in rows}
+    for key in [
+        "waiting_payment",
+        "waiting_moderation",
+        "approved",
+        "rejected",
+        "cancelled",
+        "waiting_list",
+        "expired",
+    ]:
+        data.setdefault(key, 0)
+    return data
 
 
 def count_active_registrations(event_id: int) -> int:
@@ -376,25 +515,12 @@ def count_active_registrations_by_gender(event_id: int, gender: str) -> int:
         return int(row["cnt"]) if row else 0
 
 
-def get_event_stats(event_id: int) -> dict:
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-                COUNT(*) FILTER (WHERE status IN ('waiting_payment', 'waiting_moderation', 'approved')) AS active_total,
-                COUNT(*) FILTER (WHERE status = 'waiting_payment') AS waiting_payment,
-                COUNT(*) FILTER (WHERE status = 'waiting_moderation') AS waiting_moderation,
-                COUNT(*) FILTER (WHERE status = 'approved') AS approved_total,
-                COUNT(*) FILTER (WHERE status = 'approved' AND payment_status = 'paid') AS approved_paid,
-                COUNT(*) FILTER (WHERE status = 'approved' AND payment_status = 'paid' AND gender_snapshot = 'male') AS approved_paid_male,
-                COUNT(*) FILTER (WHERE status = 'approved' AND payment_status = 'paid' AND gender_snapshot = 'female') AS approved_paid_female
-            FROM registrations
-            WHERE event_id = %s
-            """,
-            (event_id,),
-        )
-        row = cur.fetchone() or {}
-        return {k: int(v or 0) for k, v in row.items()}
+def check_age_allowed(event_row, age: int) -> tuple[bool, str]:
+    min_age = int(event_row.get("min_age") or 18)
+    max_age = int(event_row.get("max_age") or 99)
+    if age < min_age or age > max_age:
+        return False, f"Возраст для этого мероприятия: от {min_age} до {max_age} лет."
+    return True, ""
 
 
 def check_slot_available(event_row, gender: str) -> tuple[bool, str]:
@@ -405,43 +531,68 @@ def check_slot_available(event_row, gender: str) -> tuple[bool, str]:
     if event_row["gender_balance_enabled"]:
         used_for_gender = count_active_registrations_by_gender(event_row["id"], gender)
         limit_for_gender = event_row["male_limit"] if gender == "male" else event_row["female_limit"]
-        if used_for_gender >= (limit_for_gender or 0):
-            label = GENDER_LABELS.get(gender, "этого пола")
+        if limit_for_gender is not None and used_for_gender >= limit_for_gender:
+            label = GENDER_LABELS.get(gender, "этой категории")
             return False, f"Места для категории «{label}» уже закончились."
 
     return True, ""
 
 
-def create_registration_from_profile(event_row, user_row) -> int:
+def can_join_waiting_list(event_row, user_row) -> tuple[bool, str]:
+    age_ok, age_reason = check_age_allowed(event_row, user_row["age"])
+    if not age_ok:
+        return False, age_reason
+    slot_ok, slot_reason = check_slot_available(event_row, user_row["gender"])
+    if slot_ok:
+        return False, "Сейчас место доступно сразу — лист ожидания не нужен."
+    return True, slot_reason
+
+
+def create_registration_from_profile(event_row, user_row, status: str = "waiting_payment") -> int:
+    expires_at = None
+    if status == "waiting_payment":
+        expires_at = now_local() + timedelta(minutes=PAYMENT_TIMEOUT_MINUTES)
+
     with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO registrations (
-                event_id, telegram_id, name_snapshot, age_snapshot, gender_snapshot,
-                city_snapshot, phone_snapshot, status, payment_status
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, 'waiting_payment', 'not_paid')
-            RETURNING id;
-            """,
-            (
-                event_row["id"],
-                user_row["telegram_id"],
-                user_row["full_name"],
-                user_row["age"],
-                user_row["gender"],
-                user_row["city"],
-                user_row["phone"],
-            ),
-        )
-        row = cur.fetchone()
-        conn.commit()
-        return row["id"]
+        try:
+            cur.execute(
+                """
+                INSERT INTO registrations (
+                    event_id, telegram_id, name_snapshot, age_snapshot, gender_snapshot,
+                    city_snapshot, phone_snapshot, consent_snapshot, status, payment_status,
+                    reservation_expires_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id;
+                """,
+                (
+                    event_row["id"],
+                    user_row["telegram_id"],
+                    user_row["full_name"],
+                    user_row["age"],
+                    user_row["gender"],
+                    user_row["city"],
+                    user_row["phone"],
+                    bool(user_row.get("consent_personal_data")),
+                    status,
+                    "not_paid" if status == "waiting_payment" else "not_required",
+                    expires_at,
+                ),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return row["id"]
+        except UniqueViolation:
+            conn.rollback()
+            raise DuplicateRegistrationError
 
 
 def get_registration(registration_id: int):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT r.*, e.title, e.event_date, e.event_time, e.location
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.status AS event_status,
+                   e.total_limit, e.gender_balance_enabled, e.min_age, e.max_age
             FROM registrations r
             JOIN events e ON e.id = r.event_id
             WHERE r.id = %s
@@ -451,203 +602,279 @@ def get_registration(registration_id: int):
         return cur.fetchone()
 
 
+def get_waiting_list_for_event(event_id: int):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location
+            FROM registrations r
+            JOIN events e ON e.id = r.event_id
+            WHERE r.event_id = %s AND r.status = 'waiting_list'
+            ORDER BY r.created_at ASC, r.id ASC
+            """,
+            (event_id,),
+        )
+        return cur.fetchall()
+
+
+def get_approved_registrations_for_event(event_id: int):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location
+            FROM registrations r
+            JOIN events e ON e.id = r.event_id
+            WHERE r.event_id = %s AND r.status = 'approved'
+            ORDER BY r.created_at ASC, r.id ASC
+            """,
+            (event_id,),
+        )
+        return cur.fetchall()
+
+
 def update_registration_status(registration_id: int, status: str, payment_status: Optional[str] = None) -> None:
     with get_conn() as conn, conn.cursor() as cur:
         if payment_status is None:
             cur.execute(
-                "UPDATE registrations SET status = %s, moderated_at = CASE WHEN %s IN ('approved', 'rejected') THEN NOW() ELSE moderated_at END WHERE id = %s",
-                (status, status, registration_id),
+                """
+                UPDATE registrations
+                SET status = %s,
+                    reservation_expires_at = CASE
+                        WHEN %s IN ('waiting_payment') THEN reservation_expires_at
+                        ELSE NULL
+                    END,
+                    moderated_at = CASE WHEN %s IN ('approved', 'rejected') THEN NOW() ELSE moderated_at END
+                WHERE id = %s
+                """,
+                (status, status, status, registration_id),
             )
         else:
             cur.execute(
-                "UPDATE registrations SET status = %s, payment_status = %s, moderated_at = CASE WHEN %s IN ('approved', 'rejected') THEN NOW() ELSE moderated_at END WHERE id = %s",
-                (status, payment_status, status, registration_id),
+                """
+                UPDATE registrations
+                SET status = %s,
+                    payment_status = %s,
+                    reservation_expires_at = CASE
+                        WHEN %s IN ('waiting_payment') THEN reservation_expires_at
+                        ELSE NULL
+                    END,
+                    moderated_at = CASE WHEN %s IN ('approved', 'rejected') THEN NOW() ELSE moderated_at END
+                WHERE id = %s
+                """,
+                (status, payment_status, status, status, registration_id),
             )
         conn.commit()
 
 
-def get_confirmed_participants(event_id: int, gender: Optional[str] = None):
+def set_registration_waiting_payment(registration_id: int) -> datetime:
+    expires_at = now_local() + timedelta(minutes=PAYMENT_TIMEOUT_MINUTES)
     with get_conn() as conn, conn.cursor() as cur:
-        if gender:
-            cur.execute(
-                """
-                SELECT name_snapshot, gender_snapshot, phone_snapshot
-                FROM registrations
-                WHERE event_id=%s AND status='approved' AND payment_status='paid' AND gender_snapshot=%s
-                ORDER BY name_snapshot ASC
-                """,
-                (event_id, gender),
-            )
-        else:
-            cur.execute(
-                """
-                SELECT name_snapshot, gender_snapshot, phone_snapshot
-                FROM registrations
-                WHERE event_id=%s AND status='approved' AND payment_status='paid'
-                ORDER BY gender_snapshot ASC, name_snapshot ASC
-                """,
-                (event_id,),
-            )
+        cur.execute(
+            """
+            UPDATE registrations
+            SET status = 'waiting_payment',
+                payment_status = 'not_paid',
+                reservation_expires_at = %s,
+                payment_reminder_sent_at = NULL
+            WHERE id = %s
+            """,
+            (expires_at, registration_id),
+        )
+        conn.commit()
+    return expires_at
+
+
+def mark_payment_reminder_sent(registration_id: int) -> None:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE registrations SET payment_reminder_sent_at = NOW() WHERE id = %s",
+            (registration_id,),
+        )
+        conn.commit()
+
+
+def mark_before_event_reminder_sent(registration_id: int) -> None:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE registrations SET before_event_reminder_sent_at = NOW() WHERE id = %s",
+            (registration_id,),
+        )
+        conn.commit()
+
+
+def get_due_payment_reminders():
+    threshold = now_local() + timedelta(minutes=PAYMENT_REMINDER_BEFORE_MINUTES)
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location
+            FROM registrations r
+            JOIN events e ON e.id = r.event_id
+            WHERE r.status = 'waiting_payment'
+              AND r.payment_reminder_sent_at IS NULL
+              AND r.reservation_expires_at IS NOT NULL
+              AND r.reservation_expires_at <= %s
+            ORDER BY r.reservation_expires_at ASC
+            """,
+            (threshold,),
+        )
         return cur.fetchall()
 
 
-# =========================
-# RENDER / HELPERS
-# =========================
+def get_expired_registrations():
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location
+            FROM registrations r
+            JOIN events e ON e.id = r.event_id
+            WHERE r.status = 'waiting_payment'
+              AND r.reservation_expires_at IS NOT NULL
+              AND r.reservation_expires_at <= NOW()
+            ORDER BY r.reservation_expires_at ASC
+            """
+        )
+        return cur.fetchall()
 
-def format_price(value) -> str:
-    if value is None:
-        return "0"
-    if isinstance(value, Decimal):
-        if value == value.to_integral():
-            return str(int(value))
-        return str(value)
-    return str(value)
+
+def get_due_event_reminders():
+    window_end = now_local() + timedelta(hours=EVENT_REMINDER_BEFORE_HOURS)
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.status AS event_status
+            FROM registrations r
+            JOIN events e ON e.id = r.event_id
+            WHERE r.status = 'approved'
+              AND r.before_event_reminder_sent_at IS NULL
+            ORDER BY e.event_date ASC, r.id ASC
+            """
+        )
+        rows = cur.fetchall()
+
+    due = []
+    now_dt = now_local()
+    for row in rows:
+        event_dt = parse_event_datetime(row["event_date"], row["event_time"])
+        if not event_dt:
+            continue
+        if now_dt <= event_dt <= window_end:
+            due.append(row)
+    return due
 
 
-def render_event_text(event_row, admin_view: bool = False) -> str:
+def render_event_text(event_row, *, for_admin: bool = False) -> str:
+    description = html.escape(event_row.get("description") or "")
+    places_left = max(int(event_row["total_limit"]) - count_active_registrations(event_row["id"]), 0)
+
+    if not for_admin:
+        return (
+            f"<b>{html.escape(event_row['title'])}</b>\n"
+            f"Дата: {event_row['event_date']}\n"
+            f"Время: {html.escape(event_row['event_time'])}\n"
+            f"Место: {html.escape(event_row['location'])}\n"
+            f"Цена: {format_price(event_row['price'])}\n"
+            f"Мест осталось: {places_left}\n"
+            f"Возраст: {event_row.get('min_age', 18)}–{event_row.get('max_age', 99)}"
+            + (f"\nОписание: {description}" if description else "")
+        )
+
     balance = "Включен" if event_row["gender_balance_enabled"] else "Выключен"
     extra = ""
     if event_row["gender_balance_enabled"]:
         extra = f"\nБаланс М/Ж: {event_row['male_limit']}/{event_row['female_limit']}"
-    description = html.escape(event_row["description"] or "")
-    text = (
+    return (
         f"<b>{html.escape(event_row['title'])}</b>\n"
         f"ID: {event_row['id']}\n"
         f"Дата: {event_row['event_date']}\n"
         f"Время: {html.escape(event_row['event_time'])}\n"
         f"Место: {html.escape(event_row['location'])}\n"
         f"Цена: {format_price(event_row['price'])}\n"
-        f"Статус: {html.escape(event_row['status'])}\n"
+        f"Статус: {html.escape(human_event_status(event_row['status']))}\n"
         f"Лимит: {event_row['total_limit']}\n"
+        f"Свободно мест: {places_left}\n"
+        f"Возраст: {event_row.get('min_age', 18)}–{event_row.get('max_age', 99)}\n"
         f"50/50: {balance}{extra}"
+        + (f"\nОписание: {description}" if description else "")
     )
-    if description:
-        text += f"\nОписание: {description}"
-    if admin_view:
-        stats = get_event_stats(event_row["id"])
-        text += (
-            "\n\n<b>Статистика</b>\n"
-            f"Активных заявок: {stats['active_total']}\n"
-            f"Ожидают оплату: {stats['waiting_payment']}\n"
-            f"На модерации: {stats['waiting_moderation']}\n"
-            f"Подтверждено: {stats['approved_total']}\n"
-            f"Подтверждено и оплачено: {stats['approved_paid']}\n"
-            f"Подтверждено и оплачено М/Ж: {stats['approved_paid_male']}/{stats['approved_paid_female']}"
-        )
-    return text
-
 
 def render_profile_text(user_row) -> str:
+    consent_label = "Да" if user_row.get("consent_personal_data") else "Нет"
     return (
         "<b>Ваша анкета</b>\n"
         f"Имя: {html.escape(user_row['full_name'])}\n"
         f"Возраст: {user_row['age']}\n"
         f"Пол: {GENDER_LABELS.get(user_row['gender'], user_row['gender'])}\n"
         f"Город: {html.escape(user_row['city'])}\n"
-        f"Телефон: {html.escape(user_row['phone'])}"
+        f"Телефон: {html.escape(user_row['phone'])}\n"
+        f"Согласие на обработку данных: {consent_label}"
+    )
+
+
+def build_event_stats_text(event_row) -> str:
+    counts = count_registrations_by_status(event_row["id"])
+    approved = counts["approved"]
+    total_limit = max(int(event_row["total_limit"]), 1)
+    all_non_waitlist = approved + counts["waiting_payment"] + counts["waiting_moderation"] + counts["rejected"] + counts["cancelled"] + counts["expired"]
+    confirm_share = round((approved / total_limit) * 100, 1)
+    approval_rate = round((approved / all_non_waitlist) * 100, 1) if all_non_waitlist else 0
+    return (
+        f"<b>Статистика по мероприятию #{event_row['id']}</b>\n"
+        f"Название: {html.escape(event_row['title'])}\n"
+        f"Подтверждено: {approved}/{event_row['total_limit']} ({confirm_share}%)\n"
+        f"Approval rate: {approval_rate}%\n"
+        f"Ожидают оплату: {counts['waiting_payment']}\n"
+        f"На модерации: {counts['waiting_moderation']}\n"
+        f"Лист ожидания: {counts['waiting_list']}\n"
+        f"Отклонено: {counts['rejected']}\n"
+        f"Отменено: {counts['cancelled']}\n"
+        f"Истек таймер оплаты: {counts['expired']}"
     )
 
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
-        [["Хочу участвовать"], ["Партнерство", "Мои данные"]],
+        [["Участвовать"], ["Мои данные"]],
         resize_keyboard=True,
     )
 
 
-async def send_event_card(target_message, event_row, text: str, reply_markup=None):
-    if event_row.get("event_photo_file_id"):
-        return await target_message.reply_photo(
-            photo=event_row["event_photo_file_id"],
-            caption=text,
-            parse_mode=ParseMode.HTML,
-            reply_markup=reply_markup,
-        )
-    return await target_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
-
-
-async def send_or_edit_event_card(query, event_row, reply_markup=None, admin_view: bool = True):
-    text = render_event_text(event_row, admin_view=admin_view)
-    if event_row.get("event_photo_file_id"):
-        try:
-            if query.message.photo:
-                await query.edit_message_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
-            else:
-                await query.message.reply_photo(
-                    photo=event_row["event_photo_file_id"],
-                    caption=text,
-                    parse_mode=ParseMode.HTML,
-                    reply_markup=reply_markup,
-                )
-        except Exception:
-            await query.message.reply_photo(
-                photo=event_row["event_photo_file_id"],
-                caption=text,
-                parse_mode=ParseMode.HTML,
-                reply_markup=reply_markup,
-            )
-    else:
-        try:
-            await query.edit_message_text(text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
-        except Exception:
-            await query.message.reply_text(text=text, parse_mode=ParseMode.HTML, reply_markup=reply_markup)
-
-
-def event_admin_keyboard(event_id: int) -> InlineKeyboardMarkup:
+def build_pay_keyboard(event_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [
-                InlineKeyboardButton("Сделать активным", callback_data=f"activate:{event_id}"),
-                InlineKeyboardButton("Закрыть набор", callback_data=f"close:{event_id}"),
-            ],
-            [
-                InlineKeyboardButton("Редактировать", callback_data=f"editmenu:{event_id}"),
-                InlineKeyboardButton("Обновить карточку", callback_data=f"refresh:{event_id}"),
-            ],
-            [
-                InlineKeyboardButton("Выгрузить всех", callback_data=f"export:all:{event_id}"),
-                InlineKeyboardButton("Выгрузить мужчин", callback_data=f"export:male:{event_id}"),
-            ],
-            [
-                InlineKeyboardButton("Выгрузить женщин", callback_data=f"export:female:{event_id}"),
-            ],
+            [InlineKeyboardButton("Перейти к оплате", callback_data=f"pay:{event_id}")],
+            [InlineKeyboardButton("Изменить данные", callback_data="edit_profile:participate")],
         ]
     )
 
 
-def export_filename(prefix: str, event_id: int) -> str:
-    return f"event_{event_id}_{prefix}.txt"
-
-
-async def send_export_file(bot, chat_id: int, event_row, participants, label: str):
-    lines = [f"{event_row['title']}", f"Дата: {event_row['event_date']} {event_row['event_time']}", ""]
-    if not participants:
-        lines.append("Подтвержденных и оплаченных участников пока нет.")
-    else:
-        for idx, row in enumerate(participants, start=1):
-            short = SHORT_GENDER.get(row["gender_snapshot"], row["gender_snapshot"])
-            lines.append(f"{idx}. {row['name_snapshot']} ({short}) — {row['phone_snapshot']}")
-    payload = "\n".join(lines).encode("utf-8")
-    bio = BytesIO(payload)
-    bio.name = export_filename(label, event_row["id"])
-    await bot.send_document(
-        chat_id=chat_id,
-        document=bio,
-        caption=f"Выгрузка: {event_row['title']} — {label}",
+def build_waiting_list_keyboard(event_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Встать в лист ожидания", callback_data=f"join_waitlist:{event_id}")],
+            [InlineKeyboardButton("Изменить данные", callback_data="edit_profile:participate")],
+        ]
     )
 
 
-# =========================
-# USER FLOWS
-# =========================
+def build_active_event_keyboard(event_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Сделать активным", callback_data=f"activate:{event_id}")],
+            [InlineKeyboardButton("Закрыть набор", callback_data=f"close:{event_id}")],
+            [
+                InlineKeyboardButton("Статистика", callback_data=f"stats:{event_id}"),
+                InlineKeyboardButton("Экспорт confirmed", callback_data=f"export:{event_id}"),
+            ],
+            [InlineKeyboardButton("Напомнить confirmed", callback_data=f"notify_confirmed:{event_id}")],
+        ]
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
-        "Привет. Здесь можно быстро записаться на актуальное мероприятие или отправить предложение по партнерству.\n\n"
-        "Кнопки ниже:\n"
-        "• Хочу участвовать\n"
-        "• Партнерство\n"
-        "• Мои данные"
+        "Привет. Здесь можно быстро записаться на актуальное мероприятие.\n\n"
+        "Нажмите «Участвовать», чтобы подать заявку, или «Мои данные», чтобы посмотреть анкету."
     )
     await update.effective_message.reply_text(text, reply_markup=main_menu_keyboard())
 
@@ -656,7 +883,7 @@ async def show_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     profile = get_user_profile(update.effective_user.id)
     if not profile or not profile["profile_completed"]:
         await update.effective_message.reply_text(
-            "Анкета пока не заполнена. Нажмите «Хочу участвовать», и бот соберет данные один раз.",
+            "Анкета пока не заполнена. Нажмите «Участвовать», и бот соберет данные один раз.",
             reply_markup=main_menu_keyboard(),
         )
         return
@@ -681,48 +908,60 @@ async def participate_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    latest_reg = get_latest_registration_for_user_event(user.id, event_row["id"])
-    if latest_reg and latest_reg["status"] in ACTIVE_REGISTRATION_STATUSES:
-        status_map = {
-            "waiting_payment": "ожидает оплаты",
-            "waiting_moderation": "на модерации",
-            "approved": "подтверждена",
-        }
+    latest_reg = get_blocking_registration_for_user_event(user.id, event_row["id"])
+    if latest_reg:
         await update.effective_message.reply_text(
-            f"У вас уже есть заявка на это мероприятие. Текущий статус: {status_map.get(latest_reg['status'], latest_reg['status'])}.",
+            f"У вас уже есть заявка на это мероприятие. Текущий статус: {human_registration_status(latest_reg['status'])}.",
             reply_markup=main_menu_keyboard(),
         )
         return ConversationHandler.END
 
     profile = get_user_profile(user.id)
     if profile and profile["profile_completed"]:
-        ok, reason = check_slot_available(event_row, profile["gender"])
-        if not ok:
-            await update.effective_message.reply_text(reason, reply_markup=main_menu_keyboard())
-            return ConversationHandler.END
         await send_event_and_profile_confirmation(update.effective_message, profile, event_row)
         return ConversationHandler.END
 
     context.user_data["profile_source"] = "participate"
     context.user_data["profile_form"] = {}
-    intro = f"Сейчас открыта запись на:\n\n{render_event_text(event_row)}\n\nКак вас зовут?"
-    await send_event_card(update.effective_message, event_row, intro)
+    await update.effective_message.reply_text(
+        f"Сейчас открыта запись на:\n\n{render_event_text(event_row)}\n\nКак вас зовут? (Напишите ваше имя)",
+        parse_mode=ParseMode.HTML,
+        reply_markup=ReplyKeyboardRemove(),
+    )
     return PROFILE_NAME
 
 
 async def send_event_and_profile_confirmation(message, profile, event_row) -> None:
+    age_ok, age_reason = check_age_allowed(event_row, profile["age"])
+    if not age_ok:
+        text = (
+            f"Сейчас открыта запись на:\n\n{render_event_text(event_row)}\n\n"
+            f"{render_profile_text(profile)}\n\n"
+            f"⚠️ {html.escape(age_reason)}"
+        )
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Изменить данные", callback_data="edit_profile:participate")]]
+        )
+        await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        return
+
+    slot_ok, slot_reason = check_slot_available(event_row, profile["gender"])
+    if slot_ok:
+        text = (
+            f"Сейчас открыта запись на:\n\n{render_event_text(event_row)}\n\n"
+            f"{render_profile_text(profile)}\n\n"
+            f"Если все верно, переходите к оплате. После создания заявки место бронируется на {PAYMENT_TIMEOUT_MINUTES} минут."
+        )
+        await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=build_pay_keyboard(event_row["id"]))
+        return
+
     text = (
         f"Сейчас открыта запись на:\n\n{render_event_text(event_row)}\n\n"
         f"{render_profile_text(profile)}\n\n"
-        "Если все верно, переходите к оплате."
+        f"⚠️ {html.escape(slot_reason)}\n"
+        "Можно встать в лист ожидания. Если место освободится, бот напишет автоматически."
     )
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Перейти к оплате", callback_data=f"pay:{event_row['id']}")],
-            [InlineKeyboardButton("Изменить данные", callback_data="edit_profile:participate")],
-        ]
-    )
-    await send_event_card(message, event_row, text, reply_markup=keyboard)
+    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=build_waiting_list_keyboard(event_row["id"]))
 
 
 async def edit_profile_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -731,7 +970,7 @@ async def edit_profile_entry(update: Update, context: ContextTypes.DEFAULT_TYPE)
     source = query.data.split(":", 1)[1] if ":" in query.data else "profile"
     context.user_data["profile_source"] = source
     context.user_data["profile_form"] = {}
-    await query.message.reply_text("Как вас зовут?", reply_markup=ReplyKeyboardRemove())
+    await query.message.reply_text("Как вас зовут? (Напишите ваше имя)", reply_markup=ReplyKeyboardRemove())
     return PROFILE_NAME
 
 
@@ -788,18 +1027,36 @@ async def profile_city(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def profile_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = (update.message.text or "").strip().replace(" ", "")
-    digits = re.sub(r"\D", "", phone)
-    if len(digits) < 10 or len(digits) > 15:
+    phone = normalize_phone(update.message.text or "")
+    if not phone:
         await update.message.reply_text("Введите корректный номер телефона.")
         return PROFILE_PHONE
-    if phone.startswith("8") and len(digits) == 11:
-        phone = "+7" + digits[1:]
-    elif not phone.startswith("+"):
-        phone = "+" + digits
 
     form = context.user_data.get("profile_form", {})
     form["phone"] = phone
+    keyboard = ReplyKeyboardMarkup([["Согласен", "Не согласен"]], resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(
+        "Подтверждаете согласие на обработку персональных данных для записи на мероприятие?",
+        reply_markup=keyboard,
+    )
+    return PROFILE_CONSENT
+
+
+async def profile_consent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if text not in {"Согласен", "Не согласен"}:
+        await update.message.reply_text("Пожалуйста, выберите один из вариантов кнопкой ниже.")
+        return PROFILE_CONSENT
+    if text == "Не согласен":
+        await update.message.reply_text(
+            "Без согласия на обработку персональных данных запись недоступна.",
+            reply_markup=main_menu_keyboard(),
+        )
+        context.user_data.pop("profile_form", None)
+        context.user_data.pop("profile_source", None)
+        return ConversationHandler.END
+
+    form = context.user_data.get("profile_form", {})
     upsert_user_profile(
         telegram_id=update.effective_user.id,
         username=update.effective_user.username,
@@ -808,6 +1065,7 @@ async def profile_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
         gender=form["gender"],
         city=form["city"],
         phone=form["phone"],
+        consent_personal_data=True,
     )
 
     source = context.user_data.get("profile_source", "profile")
@@ -823,21 +1081,10 @@ async def profile_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=main_menu_keyboard(),
             )
             return ConversationHandler.END
-        ok, reason = check_slot_available(event_row, profile["gender"])
-        if not ok:
-            await update.message.reply_text(
-                f"Анкета сохранена. {reason}",
-                reply_markup=main_menu_keyboard(),
-            )
-            return ConversationHandler.END
         await send_event_and_profile_confirmation(update.message, profile, event_row)
     else:
         await update.message.reply_text(
-            "Анкета сохранена.",
-            reply_markup=main_menu_keyboard(),
-        )
-        await update.message.reply_text(
-            render_profile_text(profile),
+            "Анкета сохранена.\n\n" + render_profile_text(profile),
             parse_mode=ParseMode.HTML,
             reply_markup=main_menu_keyboard(),
         )
@@ -851,69 +1098,6 @@ async def cancel_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# =========================
-# PARTNERSHIP FLOW
-# =========================
-async def partnership_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["partner_form"] = {}
-    await update.effective_message.reply_text(
-        "Напишите ваше предложение по партнерству.",
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return PARTNER_PROPOSAL
-
-
-async def partnership_proposal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    proposal = (update.message.text or "").strip()
-    if len(proposal) < 5:
-        await update.message.reply_text("Опишите предложение чуть подробнее.")
-        return PARTNER_PROPOSAL
-    context.user_data.setdefault("partner_form", {})["proposal"] = proposal
-    await update.message.reply_text("Теперь отправьте контактный номер телефона.")
-    return PARTNER_PHONE
-
-
-async def partnership_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    phone = (update.message.text or "").strip().replace(" ", "")
-    digits = re.sub(r"\D", "", phone)
-    if len(digits) < 10 or len(digits) > 15:
-        await update.message.reply_text("Введите корректный номер телефона.")
-        return PARTNER_PHONE
-    if phone.startswith("8") and len(digits) == 11:
-        phone = "+7" + digits[1:]
-    elif not phone.startswith("+"):
-        phone = "+" + digits
-
-    proposal = context.user_data.get("partner_form", {}).get("proposal", "")
-    context.user_data.pop("partner_form", None)
-
-    target_chat = PARTNERSHIP_CHAT_ID or MODERATION_CHAT_ID
-    text = (
-        "<b>Новая заявка по партнерству</b>\n"
-        f"Имя: {html.escape(update.effective_user.full_name)}\n"
-        f"Username: @{html.escape(update.effective_user.username) if update.effective_user.username else 'нет'}\n"
-        f"Telegram ID: {update.effective_user.id}\n"
-        f"Телефон: {html.escape(phone)}\n\n"
-        f"Предложение:\n{html.escape(proposal)}"
-    )
-    if target_chat:
-        await context.bot.send_message(chat_id=target_chat, text=text, parse_mode=ParseMode.HTML)
-    await update.message.reply_text(
-        "Спасибо. Заявка по партнерству отправлена.",
-        reply_markup=main_menu_keyboard(),
-    )
-    return ConversationHandler.END
-
-
-async def cancel_partnership(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("partner_form", None)
-    await update.effective_message.reply_text("Отменено.", reply_markup=main_menu_keyboard())
-    return ConversationHandler.END
-
-
-# =========================
-# PAY / MODERATION
-# =========================
 async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -927,18 +1111,39 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not user_row or not user_row["profile_completed"]:
         await query.message.reply_text("Сначала заполните анкету.")
         return
-
-    latest_reg = get_latest_registration_for_user_event(query.from_user.id, event_id)
-    if latest_reg and latest_reg["status"] in ACTIVE_REGISTRATION_STATUSES:
-        await query.message.reply_text("У вас уже есть активная заявка на это мероприятие.")
+    if not user_row.get("consent_personal_data"):
+        await query.message.reply_text("Нужно подтвердить согласие на обработку персональных данных.")
         return
 
-    ok, reason = check_slot_available(event_row, user_row["gender"])
-    if not ok:
-        await query.message.reply_text(reason)
+    latest_reg = get_blocking_registration_for_user_event(query.from_user.id, event_id)
+    if latest_reg:
+        await query.message.reply_text(
+            f"У вас уже есть заявка на это мероприятие. Статус: {human_registration_status(latest_reg['status'])}."
+        )
         return
 
-    registration_id = create_registration_from_profile(event_row, user_row)
+    age_ok, age_reason = check_age_allowed(event_row, user_row["age"])
+    if not age_ok:
+        await query.message.reply_text(age_reason)
+        return
+
+    slot_ok, slot_reason = check_slot_available(event_row, user_row["gender"])
+    if not slot_ok:
+        await query.message.reply_text(
+            slot_reason,
+            reply_markup=build_waiting_list_keyboard(event_id),
+        )
+        return
+
+    try:
+        registration_id = create_registration_from_profile(event_row, user_row, status="waiting_payment")
+    except DuplicateRegistrationError:
+        await query.message.reply_text("У вас уже есть активная заявка или запись в листе ожидания на это мероприятие.")
+        return
+
+    reg = get_registration(registration_id)
+    expires_at = reg["reservation_expires_at"]
+    expires_text = expires_at.astimezone(LOCAL_TZ).strftime("%H:%M") if expires_at else "—"
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("Я оплатил", callback_data=f"paid:{registration_id}")],
@@ -947,10 +1152,53 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     text = (
         f"Заявка создана на мероприятие <b>{html.escape(event_row['title'])}</b>.\n\n"
+        f"⏳ Место забронировано за вами на {PAYMENT_TIMEOUT_MINUTES} минут — до {expires_text}.\n\n"
         f"{html.escape(PAYMENT_TEXT)}\n\n"
         "После оплаты нажмите кнопку «Я оплатил»."
     )
     await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+
+async def join_waiting_list_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    event_id = int(query.data.split(":", 1)[1])
+    event_row = get_event(event_id)
+    user_row = get_user_profile(query.from_user.id)
+
+    if not event_row or event_row["status"] != "active":
+        await query.message.reply_text("Сейчас лист ожидания для этого мероприятия недоступен.")
+        return
+    if not user_row or not user_row["profile_completed"]:
+        await query.message.reply_text("Сначала заполните анкету.")
+        return
+
+    existing = get_blocking_registration_for_user_event(query.from_user.id, event_id)
+    if existing:
+        await query.message.reply_text(
+            f"У вас уже есть запись на это мероприятие. Статус: {human_registration_status(existing['status'])}."
+        )
+        return
+
+    can_join, reason = can_join_waiting_list(event_row, user_row)
+    if not can_join:
+        await query.message.reply_text(reason)
+        return
+
+    try:
+        registration_id = create_registration_from_profile(event_row, user_row, status="waiting_list")
+    except DuplicateRegistrationError:
+        await query.message.reply_text("Вы уже есть в активной заявке или листе ожидания.")
+        return
+
+    reg = get_registration(registration_id)
+    position = len(get_waiting_list_for_event(event_id))
+    await query.message.reply_text(
+        f"Вы добавлены в лист ожидания на <b>{html.escape(reg['title'])}</b>.\n"
+        f"Текущая позиция: {position}.\n\n"
+        "Если место освободится, бот автоматически пришлет сообщение и даст время на оплату.",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def paid_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -989,7 +1237,8 @@ async def paid_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"Возраст: {reg['age_snapshot']}\n"
             f"Пол: {GENDER_LABELS.get(reg['gender_snapshot'], reg['gender_snapshot'])}\n"
             f"Город: {html.escape(reg['city_snapshot'])}\n"
-            f"Телефон: {html.escape(reg['phone_snapshot'])}"
+            f"Телефон: {html.escape(reg['phone_snapshot'])}\n"
+            f"Согласие ПД: {'Да' if reg['consent_snapshot'] else 'Нет'}"
         )
         await context.bot.send_message(
             chat_id=MODERATION_CHAT_ID,
@@ -1010,12 +1259,14 @@ async def cancel_registration_callback(update: Update, context: ContextTypes.DEF
     if reg["telegram_id"] != query.from_user.id:
         await query.message.reply_text("Это не ваша заявка.")
         return
-    if reg["status"] not in ("waiting_payment", "waiting_moderation"):
+    if reg["status"] not in ("waiting_payment", "waiting_moderation", "waiting_list"):
         await query.message.reply_text("Эту заявку уже нельзя отменить.")
         return
 
-    update_registration_status(registration_id, "cancelled", "cancelled")
+    new_payment_status = "cancelled" if reg["status"] != "waiting_list" else "not_required"
+    update_registration_status(registration_id, "cancelled", new_payment_status)
     await query.message.reply_text("Заявка отменена. Слот освобожден.")
+    await promote_waiting_list_for_event(context, reg["event_id"])
 
 
 async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1060,11 +1311,9 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
             query.message.text_html + "\n\n❌ Отклонено",
             parse_mode=ParseMode.HTML,
         )
+        await promote_waiting_list_for_event(context, reg["event_id"])
 
 
-# =========================
-# ADMIN
-# =========================
 async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         await update.effective_message.reply_text("У вас нет доступа к админ-панели.")
@@ -1073,9 +1322,24 @@ async def admin_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         [
             [InlineKeyboardButton("Добавить мероприятие", callback_data="admin_add_event")],
             [InlineKeyboardButton("Список мероприятий", callback_data="admin_list_events")],
+            [InlineKeyboardButton("Активное мероприятие", callback_data="admin_active_event")],
         ]
     )
-    await update.effective_message.reply_text("Админ-панель.", reply_markup=keyboard)
+    await update.effective_message.reply_text("Админ-панель", reply_markup=keyboard)
+
+
+async def admin_show_active_event(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text("У вас нет доступа.")
+        return
+    event_row = get_active_event()
+    if not event_row:
+        await query.message.reply_text("Сейчас нет активного мероприятия.")
+        return
+    text = render_event_text(event_row, for_admin=True) + "\n\n" + build_event_stats_text(event_row)
+    await query.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=build_active_event_keyboard(event_row["id"]))
 
 
 async def admin_add_event_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1085,17 +1349,17 @@ async def admin_add_event_entry(update: Update, context: ContextTypes.DEFAULT_TY
         await query.message.reply_text("У вас нет доступа.")
         return ConversationHandler.END
     context.user_data["new_event"] = {}
-    await query.message.reply_text("Название мероприятия?", reply_markup=ReplyKeyboardRemove())
+    await query.message.reply_text("Название мероприятия?")
     return EVENT_TITLE
 
 
 async def admin_event_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     title = (update.message.text or "").strip()
-    if len(title) < 2:
-        await update.message.reply_text("Введите название длиннее 2 символов.")
+    if len(title) < 3:
+        await update.message.reply_text("Введите нормальное название мероприятия.")
         return EVENT_TITLE
     context.user_data.setdefault("new_event", {})["title"] = title
-    await update.message.reply_text("Дата мероприятия? Формат YYYY-MM-DD")
+    await update.message.reply_text("Дата мероприятия? Формат: YYYY-MM-DD")
     return EVENT_DATE
 
 
@@ -1104,7 +1368,7 @@ async def admin_event_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         datetime.strptime(text, "%Y-%m-%d")
     except ValueError:
-        await update.message.reply_text("Введите дату в формате YYYY-MM-DD")
+        await update.message.reply_text("Неверный формат даты. Используйте YYYY-MM-DD")
         return EVENT_DATE
     context.user_data.setdefault("new_event", {})["event_date"] = text
     await update.message.reply_text("Время? Например: 19:00")
@@ -1112,13 +1376,21 @@ async def admin_event_date(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_event_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.setdefault("new_event", {})["event_time"] = (update.message.text or "").strip()
+    value = (update.message.text or "").strip()
+    if not re.search(r"\d{1,2}:\d{2}", value):
+        await update.message.reply_text("Введите время в формате 19:00")
+        return EVENT_TIME
+    context.user_data.setdefault("new_event", {})["event_time"] = value
     await update.message.reply_text("Место проведения?")
     return EVENT_LOCATION
 
 
 async def admin_event_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.setdefault("new_event", {})["location"] = (update.message.text or "").strip()
+    value = (update.message.text or "").strip()
+    if len(value) < 2:
+        await update.message.reply_text("Введите место проведения.")
+        return EVENT_LOCATION
+    context.user_data.setdefault("new_event", {})["location"] = value
     await update.message.reply_text("Стоимость участия? Только число, например 1000")
     return EVENT_PRICE
 
@@ -1133,26 +1405,13 @@ async def admin_event_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Введите корректную стоимость. Например: 1000")
         return EVENT_PRICE
     context.user_data.setdefault("new_event", {})["price"] = price
-    await update.message.reply_text("Описание мероприятия? Можно коротко.")
+    await update.message.reply_text("Описание мероприятия? Можно коротко. Если не нужно — отправьте минус.")
     return EVENT_DESCRIPTION
 
 
 async def admin_event_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.setdefault("new_event", {})["description"] = (update.message.text or "").strip()
-    await update.message.reply_text("Пришлите фото мероприятия или напишите «Пропустить».")
-    return EVENT_PHOTO
-
-
-async def admin_event_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.photo:
-        file_id = update.message.photo[-1].file_id
-        context.user_data.setdefault("new_event", {})["event_photo_file_id"] = file_id
-    else:
-        text = (update.message.text or "").strip().lower()
-        if text != "пропустить":
-            await update.message.reply_text("Пришлите фото или напишите «Пропустить».")
-            return EVENT_PHOTO
-        context.user_data.setdefault("new_event", {})["event_photo_file_id"] = None
+    text = (update.message.text or "").strip()
+    context.user_data.setdefault("new_event", {})["description"] = "" if text == "-" else text
     await update.message.reply_text("Общий лимит участников? Например: 20")
     return EVENT_LIMIT
 
@@ -1164,6 +1423,36 @@ async def admin_event_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return EVENT_LIMIT
     limit_value = int(text)
     context.user_data.setdefault("new_event", {})["total_limit"] = limit_value
+    await update.message.reply_text("Минимальный возраст? Например: 18")
+    return EVENT_MIN_AGE
+
+
+async def admin_event_min_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text.isdigit():
+        await update.message.reply_text("Введите возраст числом.")
+        return EVENT_MIN_AGE
+    value = int(text)
+    if value < 18 or value > 99:
+        await update.message.reply_text("Минимальный возраст должен быть от 18 до 99.")
+        return EVENT_MIN_AGE
+    context.user_data.setdefault("new_event", {})["min_age"] = value
+    await update.message.reply_text("Максимальный возраст? Например: 35")
+    return EVENT_MAX_AGE
+
+
+async def admin_event_max_age(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text.isdigit():
+        await update.message.reply_text("Введите возраст числом.")
+        return EVENT_MAX_AGE
+    value = int(text)
+    data = context.user_data.setdefault("new_event", {})
+    min_age = int(data.get("min_age", 18))
+    if value < min_age or value > 99:
+        await update.message.reply_text(f"Максимальный возраст должен быть не меньше {min_age} и не больше 99.")
+        return EVENT_MAX_AGE
+    data["max_age"] = value
     keyboard = InlineKeyboardMarkup(
         [
             [
@@ -1196,14 +1485,19 @@ async def admin_event_balance(update: Update, context: ContextTypes.DEFAULT_TYPE
         location=data["location"],
         price=data["price"],
         description=data.get("description", ""),
-        event_photo_file_id=data.get("event_photo_file_id"),
         total_limit=total_limit,
+        min_age=data.get("min_age", 18),
+        max_age=data.get("max_age", 99),
         gender_balance_enabled=enabled,
     )
     context.user_data.pop("new_event", None)
+
     event_row = get_event(event_id)
-    await query.message.reply_text("Мероприятие создано.")
-    await send_event_card(query.message, event_row, render_event_text(event_row, admin_view=True), reply_markup=event_admin_keyboard(event_id))
+    await query.message.reply_text(
+        "Мероприятие создано.\n\n" + render_event_text(event_row, for_admin=True),
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_active_event_keyboard(event_id),
+    )
     return ConversationHandler.END
 
 
@@ -1233,7 +1527,8 @@ async def admin_list_events(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     for event_row in events:
-        await send_event_card(target, event_row, render_event_text(event_row, admin_view=True), reply_markup=event_admin_keyboard(event_row["id"]))
+        text = render_event_text(event_row, for_admin=True) + "\n\n" + build_event_stats_text(event_row)
+        await target.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=build_active_event_keyboard(event_row["id"]))
 
 
 async def admin_event_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1252,7 +1547,7 @@ async def admin_event_status_callback(update: Update, context: ContextTypes.DEFA
         await query.message.reply_text(f"Набор на мероприятие #{event_id} закрыт.")
 
 
-async def admin_refresh_event(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def admin_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
     if not is_admin(query.from_user.id):
@@ -1263,137 +1558,42 @@ async def admin_refresh_event(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not event_row:
         await query.message.reply_text("Мероприятие не найдено.")
         return
-    await send_or_edit_event_card(query, event_row, reply_markup=event_admin_keyboard(event_id), admin_view=True)
+    await query.message.reply_text(build_event_stats_text(event_row), parse_mode=ParseMode.HTML)
 
 
-async def admin_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    if not is_admin(query.from_user.id):
-        await query.message.reply_text("У вас нет доступа.")
-        return
-    event_id = int(query.data.split(":", 1)[1])
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("Название", callback_data=f"editfield:{event_id}:title"),
-                InlineKeyboardButton("Дата", callback_data=f"editfield:{event_id}:event_date"),
-            ],
-            [
-                InlineKeyboardButton("Время", callback_data=f"editfield:{event_id}:event_time"),
-                InlineKeyboardButton("Место", callback_data=f"editfield:{event_id}:location"),
-            ],
-            [
-                InlineKeyboardButton("Цена", callback_data=f"editfield:{event_id}:price"),
-                InlineKeyboardButton("Описание", callback_data=f"editfield:{event_id}:description"),
-            ],
-            [
-                InlineKeyboardButton("Лимит", callback_data=f"editfield:{event_id}:total_limit"),
-                InlineKeyboardButton("Фото", callback_data=f"editfield:{event_id}:event_photo_file_id"),
-            ],
-        ]
-    )
-    await query.message.reply_text(f"Что изменить у мероприятия #{event_id}?", reply_markup=keyboard)
-
-
-async def admin_edit_field_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not is_admin(query.from_user.id):
-        await query.message.reply_text("У вас нет доступа.")
-        return ConversationHandler.END
-    _, event_id_str, field_name = query.data.split(":", 2)
-    event_id = int(event_id_str)
-    context.user_data["edit_event"] = {"event_id": event_id, "field": field_name}
-
-    prompts = {
-        "title": "Введите новое название.",
-        "event_date": "Введите новую дату в формате YYYY-MM-DD.",
-        "event_time": "Введите новое время. Например 19:30.",
-        "location": "Введите новое место проведения.",
-        "price": "Введите новую цену. Например 1500.",
-        "description": "Введите новое описание.",
-        "total_limit": "Введите новый общий лимит.",
-        "event_photo_file_id": "Пришлите новое фото. Чтобы удалить фото, напишите «Удалить фото».",
-    }
-    await query.message.reply_text(prompts.get(field_name, "Введите новое значение."), reply_markup=ReplyKeyboardRemove())
-    return EDIT_EVENT_VALUE
-
-
-async def admin_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    edit_ctx = context.user_data.get("edit_event")
-    if not edit_ctx:
-        await update.effective_message.reply_text("Контекст редактирования потерян.")
-        return ConversationHandler.END
-
-    event_id = int(edit_ctx["event_id"])
-    field_name = edit_ctx["field"]
-
-    try:
-        if field_name == "event_photo_file_id":
-            if update.message.photo:
-                value = update.message.photo[-1].file_id
-            else:
-                text = (update.message.text or "").strip().lower()
-                if text == "удалить фото":
-                    value = None
-                else:
-                    await update.message.reply_text("Пришлите фото или напишите «Удалить фото».")
-                    return EDIT_EVENT_VALUE
-            update_event_field(event_id, field_name, value)
-            msg = "Фото обновлено."
-
-        elif field_name == "event_date":
-            text = (update.message.text or "").strip()
-            datetime.strptime(text, "%Y-%m-%d")
-            update_event_field(event_id, field_name, text)
-            msg = "Дата обновлена."
-
-        elif field_name == "price":
-            text = (update.message.text or "").strip().replace(",", ".")
-            value = Decimal(text)
-            if value < 0:
-                raise InvalidOperation
-            update_event_field(event_id, field_name, value)
-            msg = "Цена обновлена."
-
-        elif field_name == "total_limit":
-            text = (update.message.text or "").strip()
-            if not text.isdigit() or int(text) <= 0:
-                await update.message.reply_text("Введите лимит положительным числом.")
-                return EDIT_EVENT_VALUE
-            ok, reason = update_event_limit_and_balance(event_id, int(text))
-            if not ok:
-                await update.message.reply_text(reason)
-                return EDIT_EVENT_VALUE
-            msg = reason
-
-        else:
-            value = (update.message.text or "").strip()
-            if field_name in {"title", "location", "event_time"} and len(value) < 2:
-                await update.message.reply_text("Введите значение длиннее 2 символов.")
-                return EDIT_EVENT_VALUE
-            update_event_field(event_id, field_name, value)
-            msg = "Данные обновлены."
-
-    except ValueError:
-        await update.message.reply_text("Неверный формат даты. Используйте YYYY-MM-DD.")
-        return EDIT_EVENT_VALUE
-    except Exception:
-        await update.message.reply_text("Не удалось сохранить значение. Проверьте формат и попробуйте еще раз.")
-        return EDIT_EVENT_VALUE
-
-    context.user_data.pop("edit_event", None)
-    event_row = get_event(event_id)
-    await update.message.reply_text(msg)
-    await send_event_card(update.message, event_row, render_event_text(event_row, admin_view=True), reply_markup=event_admin_keyboard(event_id))
-    return ConversationHandler.END
-
-
-async def admin_cancel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("edit_event", None)
-    await update.effective_message.reply_text("Редактирование отменено.")
-    return ConversationHandler.END
+def build_confirmed_export_bytes(event_row) -> bytes:
+    approved_rows = get_approved_registrations_for_event(event_row["id"])
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=';')
+    writer.writerow(["event_id", event_row["id"]])
+    writer.writerow(["title", event_row["title"]])
+    writer.writerow(["date", str(event_row["event_date"])])
+    writer.writerow(["time", event_row["event_time"]])
+    writer.writerow([])
+    writer.writerow([
+        "registration_id",
+        "name",
+        "age",
+        "gender",
+        "city",
+        "phone",
+        "status",
+        "payment_status",
+        "created_at",
+    ])
+    for row in approved_rows:
+        writer.writerow([
+            row["id"],
+            row["name_snapshot"],
+            row["age_snapshot"],
+            GENDER_LABELS.get(row["gender_snapshot"], row["gender_snapshot"]),
+            row["city_snapshot"],
+            row["phone_snapshot"],
+            row["status"],
+            row["payment_status"],
+            row["created_at"],
+        ])
+    return output.getvalue().encode("utf-8-sig")
 
 
 async def admin_export_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1402,44 +1602,162 @@ async def admin_export_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if not is_admin(query.from_user.id):
         await query.message.reply_text("У вас нет доступа.")
         return
-    _, gender_filter, event_id_str = query.data.split(":", 2)
-    event_id = int(event_id_str)
+    event_id = int(query.data.split(":", 1)[1])
     event_row = get_event(event_id)
     if not event_row:
         await query.message.reply_text("Мероприятие не найдено.")
         return
+    counts = count_registrations_by_status(event_id)
+    approved = counts["approved"]
+    share = round((approved / max(int(event_row["total_limit"]), 1)) * 100, 1)
+    csv_bytes = build_confirmed_export_bytes(event_row)
+    filename = f"confirmed_event_{event_id}.csv"
+    await context.bot.send_document(
+        chat_id=query.message.chat_id,
+        document=BufferedInputFile(csv_bytes, filename=filename),
+        caption=(
+            f"Экспорт по мероприятию #{event_id}.\n"
+            f"Подтверждено: {approved}/{event_row['total_limit']} ({share}%)."
+        ),
+    )
 
-    gender = None if gender_filter == "all" else gender_filter
-    label = "all" if gender is None else gender_filter
-    participants = get_confirmed_participants(event_id, gender=gender)
-    await send_export_file(context.bot, query.message.chat_id, event_row, participants, label)
 
-    if gender is None:
-        male_count = len([p for p in participants if p["gender_snapshot"] == "male"])
-        female_count = len([p for p in participants if p["gender_snapshot"] == "female"])
-        summary = f"Подтверждено и оплачено: {len(participants)}. Мужчины: {male_count}. Женщины: {female_count}."
-    else:
-        summary = f"Подтверждено и оплачено ({GENDER_LABELS.get(gender, gender)}): {len(participants)}."
-    await query.message.reply_text(summary)
+async def admin_notify_confirmed_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text("У вас нет доступа.")
+        return
+    event_id = int(query.data.split(":", 1)[1])
+    approved_rows = get_approved_registrations_for_event(event_id)
+    if not approved_rows:
+        await query.message.reply_text("Нет подтвержденных участников.")
+        return
+    sent = 0
+    for row in approved_rows:
+        try:
+            await context.bot.send_message(
+                chat_id=row["telegram_id"],
+                text=(
+                    f"Напоминание от организатора 📌\n\n"
+                    f"Мероприятие: {row['title']}\n"
+                    f"Дата: {row['event_date']} {row['event_time']}\n"
+                    f"Место: {row['location']}"
+                ),
+            )
+            sent += 1
+        except Exception as exc:
+            logger.warning("Could not notify approved participant %s: %s", row["telegram_id"], exc)
+    await query.message.reply_text(f"Напоминание отправлено: {sent} участникам.")
+
+
+async def promote_waiting_list_for_event(context: ContextTypes.DEFAULT_TYPE, event_id: int) -> None:
+    event_row = get_event(event_id)
+    if not event_row or event_row["status"] != "active":
+        return
+
+    waiters = get_waiting_list_for_event(event_id)
+    for row in waiters:
+        event_row = get_event(event_id)
+        if not event_row:
+            return
+        age_ok, _ = check_age_allowed(event_row, row["age_snapshot"])
+        if not age_ok:
+            continue
+        slot_ok, _ = check_slot_available(event_row, row["gender_snapshot"])
+        if not slot_ok:
+            continue
+
+        expires_at = set_registration_waiting_payment(row["id"])
+        expires_text = expires_at.astimezone(LOCAL_TZ).strftime("%H:%M")
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Я оплатил", callback_data=f"paid:{row['id']}")],
+                [InlineKeyboardButton("Отменить заявку", callback_data=f"cancel_reg:{row['id']}")],
+            ]
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=row["telegram_id"],
+                text=(
+                    f"Освободилось место на <b>{html.escape(row['title'])}</b> ✅\n\n"
+                    f"Вы были в листе ожидания и автоматически переведены в этап оплаты.\n"
+                    f"⏳ Место держится до {expires_text}.\n\n"
+                    f"{html.escape(PAYMENT_TEXT)}"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+        except Exception as exc:
+            logger.warning("Could not notify waiting list user %s: %s", row["telegram_id"], exc)
+
+
+async def background_maintenance(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        expired_rows = get_expired_registrations()
+        for row in expired_rows:
+            update_registration_status(row["id"], "expired", "expired")
+            try:
+                await context.bot.send_message(
+                    chat_id=row["telegram_id"],
+                    text=(
+                        f"⏰ Время на оплату мероприятия «{row['title']}» истекло. "
+                        "Заявка снята, слот освобожден."
+                    ),
+                )
+            except Exception as exc:
+                logger.warning("Could not notify expired reservation %s: %s", row["telegram_id"], exc)
+            await promote_waiting_list_for_event(context, row["event_id"])
+
+        payment_reminders = get_due_payment_reminders()
+        for row in payment_reminders:
+            expires_at = row["reservation_expires_at"]
+            expires_text = expires_at.astimezone(LOCAL_TZ).strftime("%H:%M") if expires_at else "—"
+            try:
+                await context.bot.send_message(
+                    chat_id=row["telegram_id"],
+                    text=(
+                        f"Напоминание ⏳\n\n"
+                        f"По мероприятию «{row['title']}» у вас еще не подтверждена оплата.\n"
+                        f"Бронь действует до {expires_text}."
+                    ),
+                )
+                mark_payment_reminder_sent(row["id"])
+            except Exception as exc:
+                logger.warning("Could not send payment reminder to %s: %s", row["telegram_id"], exc)
+
+        due_event_rows = get_due_event_reminders()
+        for row in due_event_rows:
+            try:
+                await context.bot.send_message(
+                    chat_id=row["telegram_id"],
+                    text=(
+                        f"Напоминание о мероприятии 📅\n\n"
+                        f"{row['title']}\n"
+                        f"Дата: {row['event_date']} {row['event_time']}\n"
+                        f"Место: {row['location']}"
+                    ),
+                )
+                mark_before_event_reminder_sent(row["id"])
+            except Exception as exc:
+                logger.warning("Could not send event reminder to %s: %s", row["telegram_id"], exc)
+    except Exception as exc:
+        logger.exception("Background maintenance failed: %s", exc)
 
 
 async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (update.message.text or "").strip()
-    if text in {"Хочу участвовать", "Участвовать", "Партнерство", "Мои данные"}:
+    if text in {"Участвовать", "Мои данные", "Согласен", "Не согласен", "Мужской", "Женский", "Мариуполь", "Другой город"}:
         return
     await update.message.reply_text("Используйте кнопки меню ниже.", reply_markup=main_menu_keyboard())
 
-
-# =========================
-# APP BUILD
-# =========================
 
 def build_application() -> Application:
     application = Application.builder().token(BOT_TOKEN).updater(None).build()
 
     profile_conv = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.Regex(r"^(Хочу участвовать|Участвовать)$"), participate_entry),
+            MessageHandler(filters.Regex(r"^Участвовать$"), participate_entry),
             CallbackQueryHandler(edit_profile_entry, pattern=r"^edit_profile:"),
         ],
         states={
@@ -1448,25 +1766,17 @@ def build_application() -> Application:
             PROFILE_GENDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, profile_gender)],
             PROFILE_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, profile_city)],
             PROFILE_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, profile_phone)],
+            PROFILE_CONSENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, profile_consent)],
         },
         fallbacks=[CommandHandler("cancel", cancel_profile)],
         per_chat=True,
         per_user=True,
     )
 
-    partner_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(r"^Партнерство$"), partnership_entry)],
-        states={
-            PARTNER_PROPOSAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, partnership_proposal)],
-            PARTNER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, partnership_phone)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel_partnership)],
-        per_chat=True,
-        per_user=True,
-    )
-
     event_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_add_event_entry, pattern=r"^admin_add_event$")],
+        entry_points=[
+            CallbackQueryHandler(admin_add_event_entry, pattern=r"^admin_add_event$")
+        ],
         states={
             EVENT_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_event_title)],
             EVENT_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_event_date)],
@@ -1474,27 +1784,12 @@ def build_application() -> Application:
             EVENT_LOCATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_event_location)],
             EVENT_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_event_price)],
             EVENT_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_event_description)],
-            EVENT_PHOTO: [
-                MessageHandler(filters.PHOTO, admin_event_photo),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_event_photo),
-            ],
             EVENT_LIMIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_event_limit)],
+            EVENT_MIN_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_event_min_age)],
+            EVENT_MAX_AGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_event_max_age)],
             EVENT_BALANCE: [CallbackQueryHandler(admin_event_balance, pattern=r"^balance:")],
         },
         fallbacks=[CommandHandler("cancel", admin_cancel_event_creation)],
-        per_chat=True,
-        per_user=True,
-    )
-
-    event_edit_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_edit_field_entry, pattern=r"^editfield:")],
-        states={
-            EDIT_EVENT_VALUE: [
-                MessageHandler(filters.PHOTO, admin_edit_value),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_edit_value),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", admin_cancel_edit)],
         per_chat=True,
         per_user=True,
     )
@@ -1503,18 +1798,18 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("admin", admin_menu))
     application.add_handler(MessageHandler(filters.Regex(r"^Мои данные$"), show_profile))
     application.add_handler(profile_conv)
-    application.add_handler(partner_conv)
     application.add_handler(event_conv)
-    application.add_handler(event_edit_conv)
     application.add_handler(CallbackQueryHandler(pay_callback, pattern=r"^pay:"))
+    application.add_handler(CallbackQueryHandler(join_waiting_list_callback, pattern=r"^join_waitlist:"))
     application.add_handler(CallbackQueryHandler(paid_callback, pattern=r"^paid:"))
     application.add_handler(CallbackQueryHandler(cancel_registration_callback, pattern=r"^cancel_reg:"))
     application.add_handler(CallbackQueryHandler(moderation_callback, pattern=r"^(approve|reject):"))
     application.add_handler(CallbackQueryHandler(admin_list_events, pattern=r"^admin_list_events$"))
+    application.add_handler(CallbackQueryHandler(admin_show_active_event, pattern=r"^admin_active_event$"))
     application.add_handler(CallbackQueryHandler(admin_event_status_callback, pattern=r"^(activate|close):"))
-    application.add_handler(CallbackQueryHandler(admin_refresh_event, pattern=r"^refresh:"))
-    application.add_handler(CallbackQueryHandler(admin_edit_menu, pattern=r"^editmenu:"))
+    application.add_handler(CallbackQueryHandler(admin_stats_callback, pattern=r"^stats:"))
     application.add_handler(CallbackQueryHandler(admin_export_callback, pattern=r"^export:"))
+    application.add_handler(CallbackQueryHandler(admin_notify_confirmed_callback, pattern=r"^notify_confirmed:"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, unknown_text))
 
     return application
@@ -1550,6 +1845,17 @@ async def on_startup():
     init_db()
     await telegram_app.initialize()
     await telegram_app.start()
+
+    if telegram_app.job_queue is not None:
+        telegram_app.job_queue.run_repeating(
+            background_maintenance,
+            interval=BACKGROUND_CHECK_INTERVAL_SECONDS,
+            first=15,
+            name="background_maintenance",
+        )
+    else:
+        logger.warning("JobQueue is unavailable. Auto-reminders and timers will not work until JobQueue is installed.")
+
     webhook_url = f"{BASE_URL.rstrip('/')}/webhook/{WEBHOOK_SECRET}"
     await telegram_app.bot.set_webhook(
         url=webhook_url,
