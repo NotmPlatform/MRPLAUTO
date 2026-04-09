@@ -390,6 +390,38 @@ def build_payment_details_text(registration_id: int) -> str:
     )
 
 
+
+def build_payment_action_keyboard(registration_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Я оплатил", callback_data=f"paid:{registration_id}")],
+            [InlineKeyboardButton("Отменить заявку", callback_data=f"cancel_reg:{registration_id}")],
+        ]
+    )
+
+
+async def send_existing_payment_prompt(message, reg) -> None:
+    expires_at = reg.get("reservation_expires_at")
+    if expires_at and expires_at <= now_local():
+        update_registration_status(reg["id"], "expired", "expired")
+        await message.reply_text(
+            "Время на оплату по вашей заявке уже истекло. Нажмите «Участвовать», чтобы создать новую заявку.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return
+
+    expires_text = expires_at.astimezone(LOCAL_TZ).strftime("%H:%M") if expires_at else "—"
+    text = (
+        f"У вас уже есть незавершённая заявка на <b>{html.escape(reg['title'])}</b>.\n\n"
+        f"ID заявки: <code>{reg['id']}</code>\n\n"
+        f"⏳ Место всё ещё забронировано за вами до {expires_text}.\n\n"
+        f"{build_payment_details_text(reg['id'])}\n\n"
+        + (f"{html.escape(PAYMENT_TEXT)}\n\n" if PAYMENT_TEXT else "")
+        + "Либо оплатите и нажмите «Я оплатил», либо удалите заявку." 
+    )
+    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=build_payment_action_keyboard(reg["id"]))
+
+
 def should_ask_car_question(event_row, user_row) -> bool:
     return bool(event_row and event_row.get("ask_has_car")) and user_row is not None and user_row.get("has_car") is None
 
@@ -632,6 +664,24 @@ def get_blocking_registration_for_user_event(telegram_id: int, event_id: int):
             LIMIT 1
             """,
             (telegram_id, event_id),
+        )
+        return cur.fetchone()
+
+
+
+def get_latest_waiting_payment_registration_for_user(telegram_id: int):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.status AS event_status
+            FROM registrations r
+            JOIN events e ON e.id = r.event_id
+            WHERE r.telegram_id = %s
+              AND r.status = 'waiting_payment'
+            ORDER BY r.created_at DESC, r.id DESC
+            LIMIT 1
+            """,
+            (telegram_id,),
         )
         return cur.fetchone()
 
@@ -1142,6 +1192,11 @@ def build_active_event_keyboard(event_id: int) -> InlineKeyboardMarkup:
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    pending_payment = get_latest_waiting_payment_registration_for_user(update.effective_user.id)
+    if pending_payment:
+        await send_existing_payment_prompt(update.effective_message, pending_payment)
+        return
+
     text = (
         "Привет. Здесь можно быстро записаться на актуальное мероприятие или оставить заявку на партнёрство.\n\n"
         "Используйте кнопки ниже: «Участвовать», «Партнерство» или «Мои данные»."
@@ -1180,6 +1235,17 @@ async def participate_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     latest_reg = get_blocking_registration_for_user_event(user.id, event_row["id"])
     if latest_reg:
+        if latest_reg["status"] == "waiting_payment":
+            reg = get_registration(latest_reg["id"])
+            if reg:
+                await send_existing_payment_prompt(update.effective_message, reg)
+            else:
+                await update.effective_message.reply_text(
+                    "У вас уже есть незавершённая заявка. Либо оплатите её, либо отмените.",
+                    reply_markup=main_menu_keyboard(),
+                )
+            return ConversationHandler.END
+
         await update.effective_message.reply_text(
             f"У вас уже есть заявка на это мероприятие. Текущий статус: {human_registration_status(latest_reg['status'])}.",
             reply_markup=main_menu_keyboard(),
@@ -1574,12 +1640,7 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     reg = get_registration(registration_id)
     expires_at = reg["reservation_expires_at"]
     expires_text = expires_at.astimezone(LOCAL_TZ).strftime("%H:%M") if expires_at else "—"
-    keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Я оплатил", callback_data=f"paid:{registration_id}")],
-            [InlineKeyboardButton("Отменить заявку", callback_data=f"cancel_reg:{registration_id}")],
-        ]
-    )
+    keyboard = build_payment_action_keyboard(registration_id)
     text = (
         f"Заявка создана на мероприятие <b>{html.escape(event_row['title'])}</b>.\n\n"
         f"ID заявки: <code>{registration_id}</code>\n\n"
@@ -2456,12 +2517,7 @@ async def promote_waiting_list_for_event(context: ContextTypes.DEFAULT_TYPE, eve
 
         expires_at = set_registration_waiting_payment(row["id"])
         expires_text = expires_at.astimezone(LOCAL_TZ).strftime("%H:%M")
-        keyboard = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("Я оплатил", callback_data=f"paid:{row['id']}")],
-                [InlineKeyboardButton("Отменить заявку", callback_data=f"cancel_reg:{row['id']}")],
-            ]
-        )
+        keyboard = build_payment_action_keyboard(row["id"])
         try:
             await context.bot.send_message(
                 chat_id=row["telegram_id"],
