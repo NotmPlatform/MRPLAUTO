@@ -7,7 +7,7 @@ import os
 import re
 import secrets
 from datetime import datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -104,7 +104,11 @@ LOCAL_TZ = ZoneInfo(TIMEZONE_LABEL)
     EDIT_EVENT_POSTER,
     ADMIN_BROADCAST_CONFIRMED_MESSAGE,
     ADMIN_RECEIPT_LINK_MESSAGE,
-) = range(100, 116)
+    PROMO_CODE_INPUT,
+    ADMIN_PROMO_CODE_VALUE,
+    ADMIN_PROMO_DISCOUNT,
+    ADMIN_PROMO_ACTIVATIONS,
+) = range(100, 120)
 
 ACTIVE_REGISTRATION_STATUSES = ("waiting_payment", "waiting_moderation", "approved")
 BLOCKING_REGISTRATION_STATUSES = ("waiting_payment", "waiting_moderation", "approved", "waiting_list")
@@ -133,6 +137,46 @@ EVENT_STATUS_LABELS = {
     "active": "Активно",
     "closed": "Набор закрыт",
 }
+FUNNEL_STEP_LABELS = {
+    "participate_clicked": "Нажали «Участвовать»",
+    "profile_started": "Начали анкету",
+    "profile_completed": "Заполнили анкету",
+    "payment_prompt_shown": "Увидели окно оплаты",
+    "pay_clicked": "Нажали «Перейти к оплате»",
+    "registration_created": "Создали заявку",
+    "promo_requested": "Нажали «Промокод»",
+    "promo_applied": "Применили промокод",
+    "paid_clicked": "Нажали «Я оплатил»",
+    "waiting_list_joined": "Встали в лист ожидания",
+    "waitlist_promoted_to_payment": "Переведены из листа ожидания к оплате",
+    "approved": "Подтверждены",
+    "rejected": "Отклонены",
+    "cancelled_before_approval": "Отменили до подтверждения",
+    "cancelled_no_payment": "Отменены: оплата не найдена",
+    "cancelled_after_approval": "Отменили после подтверждения",
+    "cancelled_by_admin": "Отменены организатором",
+    "expired": "Не оплатили вовремя",
+}
+FUNNEL_STATS_ORDER = [
+    "participate_clicked",
+    "profile_started",
+    "profile_completed",
+    "payment_prompt_shown",
+    "pay_clicked",
+    "registration_created",
+    "promo_requested",
+    "promo_applied",
+    "paid_clicked",
+    "waiting_list_joined",
+    "waitlist_promoted_to_payment",
+    "approved",
+    "rejected",
+    "cancelled_before_approval",
+    "cancelled_no_payment",
+    "cancelled_after_approval",
+    "cancelled_by_admin",
+    "expired",
+]
 PARTICIPATE_BUTTONS = {"Участвовать", "Хочу участвовать"}
 PARTNER_BUTTON = "Партнерство"
 SKIP_POSTER_TEXT = "Пропустить афишу"
@@ -215,6 +259,25 @@ def backfill_missing_payment_codes(cur) -> None:
         )
 
 
+def backfill_missing_registration_prices(cur) -> None:
+    cur.execute(
+        """
+        UPDATE registrations r
+        SET
+            base_price = COALESCE(r.base_price, e.price),
+            final_price = COALESCE(r.final_price, r.base_price, e.price),
+            discount_percent = COALESCE(r.discount_percent, 0)
+        FROM events e
+        WHERE e.id = r.event_id
+          AND (
+              r.base_price IS NULL
+              OR r.final_price IS NULL
+              OR r.discount_percent IS NULL
+          );
+        """
+    )
+
+
 def init_db() -> None:
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -277,6 +340,12 @@ def init_db() -> None:
                 receipt_url TEXT,
                 status TEXT NOT NULL DEFAULT 'waiting_payment',
                 payment_status TEXT NOT NULL DEFAULT 'not_paid',
+                base_price NUMERIC(10, 2),
+                discount_percent INTEGER NOT NULL DEFAULT 0,
+                final_price NUMERIC(10, 2),
+                promo_code_id BIGINT,
+                promo_code_value TEXT,
+                promo_applied_at TIMESTAMPTZ,
                 reservation_expires_at TIMESTAMPTZ,
                 payment_reminder_sent_at TIMESTAMPTZ,
                 before_event_reminder_sent_at TIMESTAMPTZ,
@@ -310,6 +379,33 @@ def init_db() -> None:
             );
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS promo_codes (
+                id BIGSERIAL PRIMARY KEY,
+                event_id BIGINT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                code TEXT NOT NULL,
+                discount_percent INTEGER NOT NULL,
+                max_activations INTEGER NOT NULL,
+                used_count INTEGER NOT NULL DEFAULT 0,
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS funnel_events (
+                id BIGSERIAL PRIMARY KEY,
+                event_id BIGINT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+                telegram_id BIGINT NOT NULL,
+                registration_id BIGINT REFERENCES registrations(id) ON DELETE SET NULL,
+                step TEXT NOT NULL,
+                step_meta TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+            """
+        )
 
         # Миграции для уже существующей БД
         cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS has_car BOOLEAN;")
@@ -330,6 +426,12 @@ def init_db() -> None:
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS consent_snapshot BOOLEAN NOT NULL DEFAULT FALSE;")
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS payment_code TEXT;")
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS receipt_url TEXT;")
+        cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS base_price NUMERIC(10, 2);")
+        cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS discount_percent INTEGER NOT NULL DEFAULT 0;")
+        cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS final_price NUMERIC(10, 2);")
+        cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS promo_code_id BIGINT;")
+        cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS promo_code_value TEXT;")
+        cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS promo_applied_at TIMESTAMPTZ;")
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS reservation_expires_at TIMESTAMPTZ;")
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS payment_reminder_sent_at TIMESTAMPTZ;")
         cur.execute("ALTER TABLE registrations ADD COLUMN IF NOT EXISTS before_event_reminder_sent_at TIMESTAMPTZ;")
@@ -349,6 +451,7 @@ def init_db() -> None:
         )
         cleanup_duplicate_blocking_registrations(cur)
         backfill_missing_payment_codes(cur)
+        backfill_missing_registration_prices(cur)
 
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_events_status_date ON events(status, event_date);"
@@ -379,6 +482,21 @@ def init_db() -> None:
             WHERE payment_code IS NOT NULL;
             """
         )
+        cur.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS uniq_promo_code_per_event
+            ON promo_codes(event_id, code);
+            """
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_promo_codes_event_active ON promo_codes(event_id, is_active, created_at DESC);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_funnel_event_step ON funnel_events(event_id, step, created_at DESC);"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_funnel_event_tg_event ON funnel_events(telegram_id, event_id, created_at DESC);"
+        )
         conn.commit()
 
 
@@ -396,6 +514,10 @@ def normalize_phone(raw_phone: str) -> Optional[str]:
     if phone.startswith("+"):
         return "+" + digits
     return "+" + digits
+
+
+def normalize_promo_code(raw_code: str) -> str:
+    return re.sub(r"\s+", "", (raw_code or "").strip()).upper()
 
 
 def parse_event_datetime(event_date_value, event_time_value: str) -> Optional[datetime]:
@@ -459,11 +581,51 @@ def is_valid_receipt_url(value: str) -> bool:
     return bool(re.match(r'^https?://\S+$', value))
 
 
+def get_registration_base_price(reg) -> Decimal:
+    raw = reg.get("base_price")
+    if raw is None:
+        raw = reg.get("event_price")
+    if raw is None:
+        raw = reg.get("price")
+    return Decimal(str(raw or 0))
+
+
+def get_registration_final_price(reg) -> Decimal:
+    raw = reg.get("final_price")
+    if raw is None:
+        raw = reg.get("base_price")
+    if raw is None:
+        raw = reg.get("event_price")
+    if raw is None:
+        raw = reg.get("price")
+    return Decimal(str(raw or 0))
+
+
+def has_applied_promo(reg) -> bool:
+    return bool(reg.get("promo_code_value")) or int(reg.get("discount_percent") or 0) > 0
+
+
 def build_payment_details_text(reg) -> str:
     payment_code = html.escape(str(reg.get("payment_code") or ""))
+    base_amount = get_registration_base_price(reg)
+    final_amount = get_registration_final_price(reg)
+    discount_percent = int(reg.get("discount_percent") or 0)
+    promo_code_value = reg.get("promo_code_value")
+
+    if discount_percent > 0 and final_amount != base_amount:
+        price_block = (
+            f"Стоимость без скидки: <s>{html.escape(format_rub_amount(base_amount))} ₽</s>\n"
+            f"Скидка: <b>{discount_percent}%"
+            + (f" по промокоду {html.escape(str(promo_code_value))}" if promo_code_value else "")
+            + "</b>\n"
+            f"Сумма к оплате: <b>{html.escape(format_rub_amount(final_amount))} ₽</b>\n\n"
+        )
+    else:
+        price_block = f"Сумма к оплате: <b>{html.escape(format_rub_amount(final_amount))} ₽</b>\n\n"
+
     return (
-        f"Сумма к оплате: <b>{html.escape(format_rub_amount(reg.get('price')))} ₽</b>\n\n"
-        "Номер телефона\n"
+        price_block
+        + "Номер телефона\n"
         "(оплата по СБП на Сбербанк)\n\n"
         f"<code>{html.escape(SBP_PHONE)}</code>\n\n"
         f"Получатель: {html.escape(SBP_RECEIVER)}\n\n"
@@ -472,13 +634,12 @@ def build_payment_details_text(reg) -> str:
     )
 
 
-def build_payment_action_keyboard(registration_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Я оплатил", callback_data=f"paid:{registration_id}")],
-            [InlineKeyboardButton("Отменить заявку", callback_data=f"cancel_reg:{registration_id}")],
-        ]
-    )
+def build_payment_action_keyboard(registration_id: int, include_promo: bool = True) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("Я оплатил", callback_data=f"paid:{registration_id}")]]
+    if include_promo:
+        rows.append([InlineKeyboardButton("Промокод", callback_data=f"promo:{registration_id}")])
+    rows.append([InlineKeyboardButton("Отменить заявку", callback_data=f"cancel_reg:{registration_id}")])
+    return InlineKeyboardMarkup(rows)
 
 
 def build_moderation_registration_keyboard(reg) -> InlineKeyboardMarkup:
@@ -499,6 +660,14 @@ def build_moderation_registration_keyboard(reg) -> InlineKeyboardMarkup:
 
 def build_moderation_registration_text(reg) -> str:
     receipt_line = f"\nЧек: {'добавлен' if reg.get('receipt_url') else 'не добавлен'}"
+    promo_line = ""
+    if has_applied_promo(reg):
+        promo_line = (
+            f"\nБазовая цена: {html.escape(format_rub_amount(get_registration_base_price(reg)))} ₽"
+            f"\nСкидка: {int(reg.get('discount_percent') or 0)}%"
+            + (f"\nПромокод: {html.escape(str(reg.get('promo_code_value') or ''))}" if reg.get("promo_code_value") else "")
+            + f"\nИтоговая цена: {html.escape(format_rub_amount(get_registration_final_price(reg)))} ₽"
+        )
     return (
         f"<b>Новая заявка на модерацию</b>\n"
         f"ID заявки: {reg['id']}\n"
@@ -512,6 +681,7 @@ def build_moderation_registration_text(reg) -> str:
         f"Телефон: {html.escape(reg['phone_snapshot'])}\n"
         + (f"Автомобиль: {human_has_car(reg.get('has_car_snapshot'))}\n" if reg.get('ask_has_car') else "")
         + f"Согласие ПД: {'Да' if reg['consent_snapshot'] else 'Нет'}"
+        + promo_line
         + receipt_line
     )
 
@@ -525,10 +695,189 @@ def set_registration_receipt_url(registration_id: int, receipt_url: str) -> None
         conn.commit()
 
 
+def log_funnel_event(
+    event_id: int,
+    telegram_id: int,
+    step: str,
+    registration_id: Optional[int] = None,
+    step_meta: Optional[str] = None,
+) -> None:
+    try:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO funnel_events (event_id, telegram_id, registration_id, step, step_meta)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (event_id, telegram_id, registration_id, step, step_meta),
+            )
+            conn.commit()
+    except Exception as exc:
+        logger.warning("Could not log funnel event %s for event %s user %s: %s", step, event_id, telegram_id, exc)
+
+
+def count_funnel_steps(event_id: int) -> dict[str, int]:
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT step, COUNT(DISTINCT telegram_id) AS cnt
+            FROM funnel_events
+            WHERE event_id = %s
+            GROUP BY step
+            """,
+            (event_id,),
+        )
+        rows = cur.fetchall()
+    data = {row["step"]: int(row["cnt"]) for row in rows}
+    for step in FUNNEL_STATS_ORDER:
+        data.setdefault(step, 0)
+    return data
+
+
+def create_promo_code(event_id: int, code: str, discount_percent: int, max_activations: int) -> int:
+    normalized = normalize_promo_code(code)
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO promo_codes (event_id, code, discount_percent, max_activations)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id
+            """,
+            (event_id, normalized, discount_percent, max_activations),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return int(row["id"])
+
+
+def get_promo_codes_for_event(event_id: int):
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT *
+            FROM promo_codes
+            WHERE event_id = %s
+            ORDER BY is_active DESC, created_at DESC, id DESC
+            """,
+            (event_id,),
+        )
+        return cur.fetchall()
+
+
+def apply_promo_code_to_registration(registration_id: int, raw_code: str) -> tuple[bool, str]:
+    normalized_code = normalize_promo_code(raw_code)
+    if len(normalized_code) < 3 or len(normalized_code) > 32:
+        return False, "Введите корректный промокод."
+
+    with get_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT r.id, r.event_id, r.status, r.base_price, r.final_price, r.promo_code_id, e.price AS event_price
+            FROM registrations r
+            JOIN events e ON e.id = r.event_id
+            WHERE r.id = %s
+            FOR UPDATE
+            """,
+            (registration_id,),
+        )
+        reg = cur.fetchone()
+        if not reg:
+            return False, "Заявка не найдена."
+        if reg["status"] != "waiting_payment":
+            return False, "Промокод можно применить только к заявке, которая ожидает оплату."
+        if reg.get("promo_code_id") is not None:
+            return False, "Для этой заявки промокод уже применен."
+
+        cur.execute(
+            """
+            SELECT *
+            FROM promo_codes
+            WHERE event_id = %s
+              AND code = %s
+              AND is_active = TRUE
+            FOR UPDATE
+            """,
+            (reg["event_id"], normalized_code),
+        )
+        promo = cur.fetchone()
+        if not promo:
+            return False, "Промокод не найден или неактивен."
+        if int(promo["used_count"]) >= int(promo["max_activations"]):
+            return False, "Лимит активаций этого промокода уже исчерпан."
+
+        base_amount = Decimal(str(reg.get("base_price") or reg.get("final_price") or reg.get("event_price") or 0))
+        discount_percent = int(promo["discount_percent"])
+        final_amount = (
+            base_amount * (Decimal("100") - Decimal(discount_percent)) / Decimal("100")
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if final_amount < Decimal("0.00"):
+            final_amount = Decimal("0.00")
+
+        cur.execute(
+            """
+            UPDATE registrations
+            SET
+                base_price = COALESCE(base_price, %s),
+                discount_percent = %s,
+                final_price = %s,
+                promo_code_id = %s,
+                promo_code_value = %s,
+                promo_applied_at = NOW()
+            WHERE id = %s
+            """,
+            (base_amount, discount_percent, final_amount, promo["id"], promo["code"], registration_id),
+        )
+        cur.execute(
+            "UPDATE promo_codes SET used_count = used_count + 1 WHERE id = %s",
+            (promo["id"],),
+        )
+        conn.commit()
+    return True, ""
+
+
+def render_promo_codes_text(event_row) -> str:
+    promos = get_promo_codes_for_event(event_row["id"])
+    if not promos:
+        return (
+            f"<b>Промокоды по мероприятию #{event_row['id']}</b>\n"
+            f"Название: {html.escape(event_row['title'])}\n\n"
+            "Промокодов пока нет."
+        )
+
+    lines = [
+        f"<b>Промокоды по мероприятию #{event_row['id']}</b>",
+        f"Название: {html.escape(event_row['title'])}",
+        "",
+    ]
+    for promo in promos:
+        status_text = "активен" if promo["is_active"] else "выключен"
+        lines.extend(
+            [
+                f"• <code>{html.escape(promo['code'])}</code>",
+                f"  Скидка: {promo['discount_percent']}%",
+                f"  Активации: {promo['used_count']}/{promo['max_activations']}",
+                f"  Статус: {status_text}",
+                "",
+            ]
+        )
+    return "\n".join(lines).strip()
+
+
+def build_promo_menu_keyboard(event_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Создать промокод", callback_data=f"create_promo:{event_id}")],
+            [InlineKeyboardButton("Обновить список", callback_data=f"promo_menu:{event_id}")],
+            [InlineKeyboardButton("К мероприятию", callback_data=f"edit_event_menu:{event_id}")],
+        ]
+    )
+
+
 async def send_existing_payment_prompt(message, reg) -> None:
     expires_at = reg.get("reservation_expires_at")
     if expires_at and expires_at <= now_local():
         update_registration_status(reg["id"], "expired", "expired")
+        log_funnel_event(reg["event_id"], reg["telegram_id"], "expired", reg["id"])
         await message.reply_text(
             "Время на оплату по вашей заявке уже истекло. Нажмите «Участвовать», чтобы создать новую заявку.",
             reply_markup=main_menu_keyboard(),
@@ -543,7 +892,11 @@ async def send_existing_payment_prompt(message, reg) -> None:
         f"{build_payment_details_text(reg)}\n\n"
         "После перевода нажмите кнопку «Я оплатил».\n"
     )
-    await message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=build_payment_action_keyboard(reg["id"]))
+    await message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_payment_action_keyboard(reg["id"], include_promo=not has_applied_promo(reg)),
+    )
 
 
 def build_user_receipt_button(receipt_url: Optional[str]):
@@ -826,12 +1179,11 @@ def get_blocking_registration_for_user_event(telegram_id: int, event_id: int):
         return cur.fetchone()
 
 
-
 def get_latest_waiting_payment_registration_for_user(telegram_id: int):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price, e.status AS event_status
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price AS event_price, e.status AS event_status
             FROM registrations r
             JOIN events e ON e.id = r.event_id
             WHERE r.telegram_id = %s
@@ -848,7 +1200,7 @@ def get_latest_approved_registration_for_user(telegram_id: int):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price, e.status AS event_status
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price AS event_price, e.status AS event_status
             FROM registrations r
             JOIN events e ON e.id = r.event_id
             WHERE r.telegram_id = %s
@@ -959,6 +1311,9 @@ def create_registration_from_profile(event_row, user_row, status: str = "waiting
     if status == "waiting_payment":
         expires_at = now_local() + timedelta(minutes=PAYMENT_TIMEOUT_MINUTES)
 
+    base_price = Decimal(str(event_row["price"]))
+    final_price = base_price
+
     with get_conn() as conn, conn.cursor() as cur:
         for _ in range(20):
             payment_code = generate_unique_payment_code(cur)
@@ -968,9 +1323,9 @@ def create_registration_from_profile(event_row, user_row, status: str = "waiting
                     INSERT INTO registrations (
                         event_id, telegram_id, name_snapshot, age_snapshot, gender_snapshot,
                         city_snapshot, phone_snapshot, has_car_snapshot, consent_snapshot, payment_code,
-                        status, payment_status, reservation_expires_at
+                        status, payment_status, base_price, discount_percent, final_price, reservation_expires_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id;
                     """,
                     (
@@ -986,6 +1341,9 @@ def create_registration_from_profile(event_row, user_row, status: str = "waiting
                         payment_code,
                         status,
                         "not_paid" if status == "waiting_payment" else "not_required",
+                        base_price,
+                        0,
+                        final_price,
                         expires_at,
                     ),
                 )
@@ -1007,7 +1365,7 @@ def get_registration(registration_id: int):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price, e.status AS event_status,
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price AS event_price, e.status AS event_status,
                    e.total_limit, e.gender_balance_enabled, e.min_age, e.max_age, e.ask_has_car,
                    u.has_car AS user_has_car
             FROM registrations r
@@ -1069,7 +1427,7 @@ def get_latest_contact_registration_for_user(telegram_id: int):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price, e.status AS event_status
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price AS event_price, e.status AS event_status
             FROM registrations r
             JOIN events e ON e.id = r.event_id
             WHERE r.telegram_id = %s
@@ -1087,7 +1445,7 @@ def get_waiting_list_for_event(event_id: int):
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price AS event_price
             FROM registrations r
             JOIN events e ON e.id = r.event_id
             WHERE r.event_id = %s AND r.status = 'waiting_list'
@@ -1103,7 +1461,7 @@ def get_approved_registrations_for_event(event_id: int):
         cur.execute(
             """
             SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.ask_has_car,
-                   u.has_car AS user_has_car
+                   e.price AS event_price, u.has_car AS user_has_car
             FROM registrations r
             JOIN events e ON e.id = r.event_id
             LEFT JOIN users u ON u.telegram_id = r.telegram_id
@@ -1190,7 +1548,7 @@ def get_due_payment_reminders():
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price AS event_price
             FROM registrations r
             JOIN events e ON e.id = r.event_id
             WHERE r.status = 'waiting_payment'
@@ -1208,7 +1566,7 @@ def get_expired_registrations():
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price AS event_price
             FROM registrations r
             JOIN events e ON e.id = r.event_id
             WHERE r.status = 'waiting_payment'
@@ -1225,7 +1583,7 @@ def get_due_event_reminders():
     with get_conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price, e.status AS event_status
+            SELECT r.*, e.title, e.event_date, e.event_time, e.location, e.price AS event_price, e.status AS event_status
             FROM registrations r
             JOIN events e ON e.id = r.event_id
             WHERE r.status = 'approved'
@@ -1301,26 +1659,32 @@ def render_profile_text(user_row) -> str:
 
 def build_event_stats_text(event_row) -> str:
     counts = count_registrations_by_status(event_row["id"])
+    funnel = count_funnel_steps(event_row["id"])
     approved = counts["approved"]
     total_limit = max(int(event_row["total_limit"]), 1)
     all_non_waitlist = approved + counts["waiting_payment"] + counts["waiting_moderation"] + counts["rejected"] + counts["cancelled"] + counts["cancelled_no_payment"] + counts["cancelled_by_user"] + counts["expired"]
     confirm_share = round((approved / total_limit) * 100, 1)
     approval_rate = round((approved / all_non_waitlist) * 100, 1) if all_non_waitlist else 0
-    return (
-        f"<b>Статистика по мероприятию #{event_row['id']}</b>\n"
-        f"Название: {html.escape(event_row['title'])}\n"
-        f"Вопрос про авто: {'Да' if event_row.get('ask_has_car') else 'Нет'}\n"
-        f"Подтверждено: {approved}/{event_row['total_limit']} ({confirm_share}%)\n"
-        f"Approval rate: {approval_rate}%\n"
-        f"Ожидают оплату: {counts['waiting_payment']}\n"
-        f"На модерации: {counts['waiting_moderation']}\n"
-        f"Лист ожидания: {counts['waiting_list']}\n"
-        f"Отклонено: {counts['rejected']}\n"
-        f"Отменено: {counts['cancelled']}\n"
-        f"Отменено участником: {counts['cancelled_by_user']}\n"
-        f"Отменено: нет оплаты: {counts['cancelled_no_payment']}\n"
-        f"Истек таймер оплаты: {counts['expired']}"
-    )
+    lines = [
+        f"<b>Статистика по мероприятию #{event_row['id']}</b>",
+        f"Название: {html.escape(event_row['title'])}",
+        f"Вопрос про авто: {'Да' if event_row.get('ask_has_car') else 'Нет'}",
+        f"Подтверждено: {approved}/{event_row['total_limit']} ({confirm_share}%)",
+        f"Approval rate: {approval_rate}%",
+        f"Ожидают оплату: {counts['waiting_payment']}",
+        f"На модерации: {counts['waiting_moderation']}",
+        f"Лист ожидания: {counts['waiting_list']}",
+        f"Отклонено: {counts['rejected']}",
+        f"Отменено: {counts['cancelled']}",
+        f"Отменено участником: {counts['cancelled_by_user']}",
+        f"Отменено: нет оплаты: {counts['cancelled_no_payment']}",
+        f"Истек таймер оплаты: {counts['expired']}",
+        "",
+        "<b>Воронка по шагам</b>",
+    ]
+    for step in FUNNEL_STATS_ORDER:
+        lines.append(f"{FUNNEL_STEP_LABELS[step]}: {funnel.get(step, 0)}")
+    return "\n".join(lines)
 
 
 def render_partner_request_text(partner_id: int, data: dict) -> str:
@@ -1362,6 +1726,7 @@ def build_edit_event_keyboard(event_row) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Макс. возраст", callback_data=f"edit_event_field:max_age:{event_id}"),
                 InlineKeyboardButton("Вопрос про авто", callback_data=f"edit_event_field:ask_has_car:{event_id}"),
             ],
+            [InlineKeyboardButton("Промокоды", callback_data=f"promo_menu:{event_id}")],
             [InlineKeyboardButton("Удалить", callback_data=f"delete_event_prompt:{event_id}")],
         ]
     )
@@ -1447,10 +1812,13 @@ def build_active_event_keyboard(event_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("Экспорт CSV", callback_data=f"export:{event_id}"),
             ],
             [
-                InlineKeyboardButton("Напоминание", callback_data=f"remind_confirmed:{event_id}"),
+                InlineKeyboardButton("Промокоды", callback_data=f"promo_menu:{event_id}"),
                 InlineKeyboardButton("Рассылка", callback_data=f"notify_confirmed:{event_id}"),
             ],
-            [InlineKeyboardButton("Удалить", callback_data=f"delete_event_prompt:{event_id}")],
+            [
+                InlineKeyboardButton("Напоминание", callback_data=f"remind_confirmed:{event_id}"),
+                InlineKeyboardButton("Удалить", callback_data=f"delete_event_prompt:{event_id}"),
+            ],
         ]
     )
 
@@ -1502,6 +1870,8 @@ async def participate_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
+    log_funnel_event(event_row["id"], user.id, "participate_clicked")
+
     latest_reg = get_blocking_registration_for_user_event(user.id, event_row["id"])
     if latest_reg:
         if latest_reg["status"] == "waiting_payment":
@@ -1543,6 +1913,7 @@ async def participate_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["profile_source"] = "participate"
     context.user_data["profile_form"] = {}
+    log_funnel_event(event_row["id"], user.id, "profile_started")
     await send_event_card(
         update.effective_message,
         event_row,
@@ -1572,6 +1943,7 @@ async def send_event_and_profile_confirmation(message, profile, event_row) -> No
 
     slot_ok, slot_reason = check_slot_available(event_row, profile["gender"])
     if slot_ok:
+        log_funnel_event(event_row["id"], profile["telegram_id"], "payment_prompt_shown")
         await send_event_card(
             message,
             event_row,
@@ -1608,6 +1980,7 @@ async def edit_profile_entry(update: Update, context: ContextTypes.DEFAULT_TYPE)
         event_row = get_active_event()
         if event_row:
             context.user_data["profile_event_id"] = event_row["id"]
+            log_funnel_event(event_row["id"], query.from_user.id, "profile_started")
     context.user_data["profile_form"] = {}
     await query.message.reply_text("Как вас зовут? (Напишите ваше имя)", reply_markup=ReplyKeyboardRemove())
     return PROFILE_NAME
@@ -1722,6 +2095,7 @@ async def profile_consent(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             context.user_data.pop("profile_event_id", None)
             return ConversationHandler.END
+        log_funnel_event(event_row["id"], update.effective_user.id, "profile_completed")
         if should_ask_car_question(event_row, profile):
             await ask_user_has_car(update.message)
             return PROFILE_HAS_CAR
@@ -1891,6 +2265,8 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
+    log_funnel_event(event_id, query.from_user.id, "pay_clicked")
+
     latest_reg = get_blocking_registration_for_user_event(query.from_user.id, event_id)
     if latest_reg:
         await query.message.reply_text(
@@ -1918,9 +2294,10 @@ async def pay_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     reg = get_registration(registration_id)
+    log_funnel_event(event_id, query.from_user.id, "registration_created", registration_id)
     expires_at = reg["reservation_expires_at"]
     expires_text = expires_at.astimezone(LOCAL_TZ).strftime("%H:%M") if expires_at else "—"
-    keyboard = build_payment_action_keyboard(registration_id)
+    keyboard = build_payment_action_keyboard(registration_id, include_promo=True)
     text = (
         "<b>Заявка создана ✅</b>\n\n"
         f"Мероприятие: <b>{html.escape(event_row['title'])}</b>\n\n"
@@ -1964,6 +2341,7 @@ async def join_waiting_list_callback(update: Update, context: ContextTypes.DEFAU
         return
 
     reg = get_registration(registration_id)
+    log_funnel_event(event_id, query.from_user.id, "waiting_list_joined", registration_id)
     position = len(get_waiting_list_for_event(event_id))
     await query.message.reply_text(
         f"Вы добавлены в лист ожидания на <b>{html.escape(reg['title'])}</b>.\n"
@@ -1971,6 +2349,79 @@ async def join_waiting_list_callback(update: Update, context: ContextTypes.DEFAU
         "Если место освободится, бот автоматически пришлет сообщение и даст время на оплату.",
         parse_mode=ParseMode.HTML,
     )
+
+
+async def promo_code_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    registration_id = int(query.data.split(":", 1)[1])
+    reg = get_registration(registration_id)
+    if not reg:
+        await query.message.reply_text("Заявка не найдена.")
+        return ConversationHandler.END
+    if reg["telegram_id"] != query.from_user.id:
+        await query.message.reply_text("Это не ваша заявка.")
+        return ConversationHandler.END
+    if reg["status"] != "waiting_payment":
+        await query.message.reply_text("Промокод можно применить только к заявке, ожидающей оплату.")
+        return ConversationHandler.END
+    if has_applied_promo(reg):
+        await query.message.reply_text("Для этой заявки промокод уже применён.")
+        return ConversationHandler.END
+
+    log_funnel_event(reg["event_id"], query.from_user.id, "promo_requested", registration_id)
+    context.user_data["promo_registration_id"] = registration_id
+    await query.message.reply_text(
+        "Введите промокод одним сообщением.\nЧтобы отменить, отправьте «Отмена».",
+        reply_markup=ReplyKeyboardMarkup([[CANCEL_EDIT_TEXT]], resize_keyboard=True, one_time_keyboard=True),
+    )
+    return PROMO_CODE_INPUT
+
+
+async def promo_code_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    registration_id = context.user_data.get("promo_registration_id")
+    if not registration_id:
+        await update.message.reply_text("Нет активного ввода промокода.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    text_value = (update.message.text or "").strip()
+    if text_value == CANCEL_EDIT_TEXT:
+        context.user_data.pop("promo_registration_id", None)
+        await update.message.reply_text("Ввод промокода отменён.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    reg = get_registration(registration_id)
+    if not reg:
+        context.user_data.pop("promo_registration_id", None)
+        await update.message.reply_text("Заявка не найдена.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+    if reg["telegram_id"] != update.effective_user.id:
+        context.user_data.pop("promo_registration_id", None)
+        await update.message.reply_text("Это не ваша заявка.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    ok, error_text = apply_promo_code_to_registration(registration_id, text_value)
+    if not ok:
+        await update.message.reply_text(error_text)
+        return PROMO_CODE_INPUT
+
+    context.user_data.pop("promo_registration_id", None)
+    reg = get_registration(registration_id)
+    log_funnel_event(reg["event_id"], update.effective_user.id, "promo_applied", registration_id, normalize_promo_code(text_value))
+    expires_at = reg["reservation_expires_at"]
+    expires_text = expires_at.astimezone(LOCAL_TZ).strftime("%H:%M") if expires_at else "—"
+    await update.message.reply_text(
+        (
+            "<b>Промокод применён ✅</b>\n\n"
+            f"Мероприятие: <b>{html.escape(reg['title'])}</b>\n\n"
+            f"⏳ Бронь места действует до <b>{expires_text}</b>.\n\n"
+            f"{build_payment_details_text(reg)}\n\n"
+            "После перевода нажмите кнопку «Я оплатил».\n"
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_payment_action_keyboard(registration_id, include_promo=False),
+    )
+    return ConversationHandler.END
 
 
 async def paid_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1989,6 +2440,8 @@ async def paid_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         return
 
     update_registration_status(registration_id, "waiting_moderation", "claimed_paid")
+    log_funnel_event(reg["event_id"], query.from_user.id, "paid_clicked", registration_id)
+    reg = get_registration(registration_id)
     await query.message.reply_text("Спасибо. Заявка отправлена на модерацию. Скоро подтвердим бронь.")
 
     if MODERATION_CHAT_ID:
@@ -2019,6 +2472,7 @@ async def cancel_registration_callback(update: Update, context: ContextTypes.DEF
 
     new_payment_status = "cancelled" if reg["status"] != "waiting_list" else "not_required"
     update_registration_status(registration_id, "cancelled", new_payment_status)
+    log_funnel_event(reg["event_id"], query.from_user.id, "cancelled_before_approval", registration_id)
     await query.message.reply_text("Заявка отменена. Слот освобожден.")
     await promote_waiting_list_for_event(context, reg["event_id"])
 
@@ -2042,6 +2496,7 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if action == "approve":
         update_registration_status(registration_id, "approved", "paid")
+        log_funnel_event(reg["event_id"], reg["telegram_id"], "approved", registration_id)
         reg = get_registration(registration_id)
         await context.bot.send_message(
             chat_id=reg["telegram_id"],
@@ -2063,6 +2518,7 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if action == "reject":
         update_registration_status(registration_id, "rejected", "rejected")
+        log_funnel_event(reg["event_id"], reg["telegram_id"], "rejected", registration_id)
         await context.bot.send_message(
             chat_id=reg["telegram_id"],
             text="К сожалению, заявка отклонена. Слот освобожден. Вы можете зайти снова и подать новую заявку.",
@@ -2076,6 +2532,7 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if action == "cancel_nopay":
         update_registration_status(registration_id, "cancelled_no_payment", "not_paid")
+        log_funnel_event(reg["event_id"], reg["telegram_id"], "cancelled_no_payment", registration_id)
         await context.bot.send_message(
             chat_id=reg["telegram_id"],
             text=(
@@ -2092,6 +2549,7 @@ async def moderation_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if action == "cancel_admin":
         update_registration_status(registration_id, "cancelled", "cancelled")
+        log_funnel_event(reg["event_id"], reg["telegram_id"], "cancelled_by_admin", registration_id)
         await context.bot.send_message(
             chat_id=reg["telegram_id"],
             text=(
@@ -2160,6 +2618,7 @@ async def user_cancel_after_approval_confirm_callback(update: Update, context: C
         return
 
     update_registration_status(registration_id, "cancelled_by_user", "cancelled_after_approval")
+    log_funnel_event(reg["event_id"], reg["telegram_id"], "cancelled_after_approval", registration_id)
     await query.message.reply_text(
         "Ваше участие отменено. Организатору отправлено уведомление.",
         reply_markup=main_menu_keyboard(),
@@ -2243,6 +2702,136 @@ async def admin_edit_current_event(update: Update, context: ContextTypes.DEFAULT
         intro="Редактирование текущего мероприятия:",
         reply_markup=build_edit_event_keyboard(event_row),
     )
+
+
+async def admin_promo_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text("У вас нет доступа.")
+        return
+    event_id = int(query.data.split(":", 1)[1])
+    event_row = get_event(event_id)
+    if not event_row:
+        await query.message.reply_text("Мероприятие не найдено.")
+        return
+    await query.message.reply_text(
+        render_promo_codes_text(event_row),
+        parse_mode=ParseMode.HTML,
+        reply_markup=build_promo_menu_keyboard(event_id),
+    )
+
+
+async def admin_create_promo_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        await query.message.reply_text("У вас нет доступа.")
+        return ConversationHandler.END
+    event_id = int(query.data.split(":", 1)[1])
+    event_row = get_event(event_id)
+    if not event_row:
+        await query.message.reply_text("Мероприятие не найдено.")
+        return ConversationHandler.END
+
+    context.user_data["promo_create_event_id"] = event_id
+    await query.message.reply_text(
+        f"Создание промокода для мероприятия «{event_row['title']}».\n\nВведите сам промокод, например LOVE50.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return ADMIN_PROMO_CODE_VALUE
+
+
+async def admin_create_promo_code_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    event_id = context.user_data.get("promo_create_event_id")
+    if not event_id:
+        await update.message.reply_text("Нет активного создания промокода.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    raw_value = (update.message.text or "").strip()
+    if raw_value == CANCEL_EDIT_TEXT:
+        context.user_data.pop("promo_create_event_id", None)
+        context.user_data.pop("promo_create_data", None)
+        await update.message.reply_text("Создание промокода отменено.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    code_value = normalize_promo_code(raw_value)
+    if len(code_value) < 3 or len(code_value) > 32 or not re.match(r"^[A-ZА-Я0-9_-]+$", code_value):
+        await update.message.reply_text("Промокод должен быть от 3 до 32 символов и содержать буквы, цифры, _ или -.")
+        return ADMIN_PROMO_CODE_VALUE
+
+    data = context.user_data.setdefault("promo_create_data", {})
+    data["code"] = code_value
+    await update.message.reply_text("Введите процент скидки, например 10 или 50.")
+    return ADMIN_PROMO_DISCOUNT
+
+
+async def admin_create_promo_discount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text_value = (update.message.text or "").strip()
+    if text_value == CANCEL_EDIT_TEXT:
+        context.user_data.pop("promo_create_event_id", None)
+        context.user_data.pop("promo_create_data", None)
+        await update.message.reply_text("Создание промокода отменено.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    if not text_value.isdigit():
+        await update.message.reply_text("Введите скидку целым числом от 1 до 100.")
+        return ADMIN_PROMO_DISCOUNT
+
+    discount = int(text_value)
+    if discount < 1 or discount > 100:
+        await update.message.reply_text("Скидка должна быть от 1 до 100 процентов.")
+        return ADMIN_PROMO_DISCOUNT
+
+    data = context.user_data.setdefault("promo_create_data", {})
+    data["discount_percent"] = discount
+    await update.message.reply_text("Введите количество активаций промокода.")
+    return ADMIN_PROMO_ACTIVATIONS
+
+
+async def admin_create_promo_activations(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    event_id = context.user_data.get("promo_create_event_id")
+    data = context.user_data.get("promo_create_data", {})
+    if not event_id:
+        await update.message.reply_text("Нет активного создания промокода.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    text_value = (update.message.text or "").strip()
+    if text_value == CANCEL_EDIT_TEXT:
+        context.user_data.pop("promo_create_event_id", None)
+        context.user_data.pop("promo_create_data", None)
+        await update.message.reply_text("Создание промокода отменено.", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    if not text_value.isdigit() or int(text_value) <= 0:
+        await update.message.reply_text("Введите количество активаций положительным числом.")
+        return ADMIN_PROMO_ACTIVATIONS
+
+    max_activations = int(text_value)
+    try:
+        create_promo_code(
+            event_id=event_id,
+            code=data["code"],
+            discount_percent=int(data["discount_percent"]),
+            max_activations=max_activations,
+        )
+    except UniqueViolation:
+        await update.message.reply_text("Такой промокод для этого мероприятия уже существует.")
+        return ADMIN_PROMO_ACTIVATIONS
+    except Exception as exc:
+        logger.warning("Could not create promo code for event %s: %s", event_id, exc)
+        await update.message.reply_text("Не удалось создать промокод. Проверьте данные и попробуйте снова.")
+        return ADMIN_PROMO_ACTIVATIONS
+
+    event_row = get_event(event_id)
+    context.user_data.pop("promo_create_event_id", None)
+    context.user_data.pop("promo_create_data", None)
+    await update.message.reply_text(
+        "Промокод создан.\n\n" + render_promo_codes_text(event_row),
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(),
+    )
+    return ConversationHandler.END
 
 
 async def admin_delete_event_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2753,6 +3342,9 @@ async def admin_edit_event_poster(update: Update, context: ContextTypes.DEFAULT_
 async def admin_cancel_event_creation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("new_event", None)
     context.user_data.pop("edit_event", None)
+    context.user_data.pop("promo_create_event_id", None)
+    context.user_data.pop("promo_create_data", None)
+    context.user_data.pop("promo_registration_id", None)
     await update.effective_message.reply_text("Действие отменено.", reply_markup=main_menu_keyboard())
     return ConversationHandler.END
 
@@ -2807,7 +3399,10 @@ def build_confirmed_export_bytes(event_row) -> bytes:
         "has_car",
         "status",
         "payment_status",
-        "payment_code",
+        "base_price",
+        "discount_percent",
+        "final_price",
+        "promo_code",
         "receipt_url",
         "created_at",
     ])
@@ -2823,7 +3418,10 @@ def build_confirmed_export_bytes(event_row) -> bytes:
             human_has_car(row.get("has_car_snapshot") if row.get("has_car_snapshot") is not None else row.get("user_has_car")),
             row["status"],
             row["payment_status"],
-            row.get("payment_code"),
+            row.get("base_price"),
+            row.get("discount_percent"),
+            row.get("final_price"),
+            row.get("promo_code_value"),
             row.get("receipt_url"),
             row["created_at"],
         ])
@@ -3007,9 +3605,10 @@ async def promote_waiting_list_for_event(context: ContextTypes.DEFAULT_TYPE, eve
             continue
 
         expires_at = set_registration_waiting_payment(row["id"])
-        expires_text = expires_at.astimezone(LOCAL_TZ).strftime("%H:%M")
-        keyboard = build_payment_action_keyboard(row["id"])
         reg = get_registration(row["id"])
+        log_funnel_event(event_id, row["telegram_id"], "waitlist_promoted_to_payment", row["id"])
+        expires_text = expires_at.astimezone(LOCAL_TZ).strftime("%H:%M")
+        keyboard = build_payment_action_keyboard(row["id"], include_promo=not has_applied_promo(reg))
         try:
             await context.bot.send_message(
                 chat_id=row["telegram_id"],
@@ -3026,6 +3625,7 @@ async def promote_waiting_list_for_event(context: ContextTypes.DEFAULT_TYPE, eve
             )
         except Exception as exc:
             logger.warning("Could not notify waiting list user %s: %s", row["telegram_id"], exc)
+        return
 
 
 async def background_maintenance(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3033,6 +3633,7 @@ async def background_maintenance(context: ContextTypes.DEFAULT_TYPE) -> None:
         expired_rows = get_expired_registrations()
         for row in expired_rows:
             update_registration_status(row["id"], "expired", "expired")
+            log_funnel_event(row["event_id"], row["telegram_id"], "expired", row["id"])
             try:
                 await context.bot.send_message(
                     chat_id=row["telegram_id"],
@@ -3334,6 +3935,28 @@ def build_application() -> Application:
         per_user=True,
     )
 
+    promo_input_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(promo_code_entry, pattern=r"^promo:")],
+        states={
+            PROMO_CODE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, promo_code_input)],
+        },
+        fallbacks=[CommandHandler("cancel", admin_cancel_event_creation)],
+        per_chat=True,
+        per_user=True,
+    )
+
+    promo_admin_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_create_promo_entry, pattern=r"^create_promo:")],
+        states={
+            ADMIN_PROMO_CODE_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_create_promo_code_value)],
+            ADMIN_PROMO_DISCOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_create_promo_discount)],
+            ADMIN_PROMO_ACTIVATIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_create_promo_activations)],
+        },
+        fallbacks=[CommandHandler("cancel", admin_cancel_event_creation)],
+        per_chat=True,
+        per_user=True,
+    )
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_menu))
     application.add_handler(MessageHandler(filters.Regex(r"^Мои данные$"), show_profile))
@@ -3342,6 +3965,8 @@ def build_application() -> Application:
     application.add_handler(event_conv)
     application.add_handler(edit_event_conv)
     application.add_handler(notify_confirmed_conv)
+    application.add_handler(promo_input_conv)
+    application.add_handler(promo_admin_conv)
     application.add_handler(CallbackQueryHandler(pay_callback, pattern=r"^pay:"))
     application.add_handler(CallbackQueryHandler(join_waiting_list_callback, pattern=r"^join_waitlist:"))
     application.add_handler(CallbackQueryHandler(paid_callback, pattern=r"^paid:"))
@@ -3354,6 +3979,7 @@ def build_application() -> Application:
     application.add_handler(CallbackQueryHandler(admin_show_active_event, pattern=r"^admin_active_event$"))
     application.add_handler(CallbackQueryHandler(admin_edit_current_event, pattern=r"^admin_edit_current_event$"))
     application.add_handler(CallbackQueryHandler(admin_edit_event_menu, pattern=r"^edit_event_menu:"))
+    application.add_handler(CallbackQueryHandler(admin_promo_menu_callback, pattern=r"^promo_menu:"))
     application.add_handler(CallbackQueryHandler(admin_event_status_callback, pattern=r"^(activate|close):"))
     application.add_handler(CallbackQueryHandler(admin_delete_event_prompt, pattern=r"^delete_event_prompt:"))
     application.add_handler(CallbackQueryHandler(admin_delete_event_confirm, pattern=r"^delete_event_confirm:"))
