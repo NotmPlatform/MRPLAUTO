@@ -1305,7 +1305,6 @@ def can_join_waiting_list(event_row, user_row) -> tuple[bool, str]:
         return False, "Сейчас место доступно сразу — лист ожидания не нужен."
     return True, slot_reason
 
-
 def create_registration_from_profile(event_row, user_row, status: str = "waiting_payment") -> int:
     expires_at = None
     if status == "waiting_payment":
@@ -3943,6 +3942,7 @@ def build_application() -> Application:
         fallbacks=[CommandHandler("cancel", admin_cancel_event_creation)],
         per_chat=True,
         per_user=True,
+        allow_reentry=True,
     )
 
     promo_admin_conv = ConversationHandler(
@@ -3955,18 +3955,19 @@ def build_application() -> Application:
         fallbacks=[CommandHandler("cancel", admin_cancel_event_creation)],
         per_chat=True,
         per_user=True,
+        allow_reentry=True,
     )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_menu))
     application.add_handler(MessageHandler(filters.Regex(r"^Мои данные$"), show_profile))
+    application.add_handler(promo_input_conv)
+    application.add_handler(promo_admin_conv)
     application.add_handler(profile_conv)
     application.add_handler(partner_conv)
     application.add_handler(event_conv)
     application.add_handler(edit_event_conv)
     application.add_handler(notify_confirmed_conv)
-    application.add_handler(promo_input_conv)
-    application.add_handler(promo_admin_conv)
     application.add_handler(CallbackQueryHandler(pay_callback, pattern=r"^pay:"))
     application.add_handler(CallbackQueryHandler(join_waiting_list_callback, pattern=r"^join_waitlist:"))
     application.add_handler(CallbackQueryHandler(paid_callback, pattern=r"^paid:"))
