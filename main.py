@@ -3873,6 +3873,7 @@ def build_application() -> Application:
         fallbacks=[CommandHandler("cancel", cancel_profile)],
         per_chat=True,
         per_user=True,
+        allow_reentry=True,
     )
 
     partner_conv = ConversationHandler(
