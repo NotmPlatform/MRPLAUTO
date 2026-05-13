@@ -25,6 +25,7 @@ from telegram import (
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -62,6 +63,12 @@ PAYMENT_REMINDER_BEFORE_MINUTES = int(os.getenv("PAYMENT_REMINDER_BEFORE_MINUTES
 PAYMENT_CODE_LENGTH = int(os.getenv("PAYMENT_CODE_LENGTH", "6"))
 EVENT_REMINDER_BEFORE_HOURS = int(os.getenv("EVENT_REMINDER_BEFORE_HOURS", "24"))
 BACKGROUND_CHECK_INTERVAL_SECONDS = int(os.getenv("BACKGROUND_CHECK_INTERVAL_SECONDS", "300"))
+BOT_STUB_ENABLED = os.getenv("BOT_STUB_ENABLED", "1").lower() in {"1", "true", "yes", "on"}
+BOT_STUB_TEXT = os.getenv(
+    "BOT_STUB_TEXT",
+    "Бот временно не принимает сообщения.\n\n"
+    "Свяжитесь с администратором через контакты в канале.",
+)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is required")
@@ -3838,6 +3845,46 @@ async def bridge_user_message_to_moderation(update: Update, context: ContextType
     return True
 
 
+def is_admin_update(update: Update) -> bool:
+    return bool(update.effective_user and update.effective_user.id in ADMIN_USER_IDS)
+
+
+async def bot_stub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not BOT_STUB_ENABLED:
+        return
+    if update.effective_chat and update.effective_chat.id == MODERATION_CHAT_ID:
+        return
+    if is_admin_update(update):
+        return
+
+    message = update.effective_message
+    if message:
+        await message.reply_text(
+            BOT_STUB_TEXT,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    raise ApplicationHandlerStop
+
+
+async def bot_stub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not BOT_STUB_ENABLED:
+        return
+    if update.effective_chat and update.effective_chat.id == MODERATION_CHAT_ID:
+        return
+    if is_admin_update(update):
+        return
+
+    query = update.callback_query
+    if query:
+        await query.answer("Бот временно не принимает сообщения.", show_alert=True)
+        if query.message:
+            await query.message.reply_text(
+                BOT_STUB_TEXT,
+                reply_markup=ReplyKeyboardRemove(),
+            )
+    raise ApplicationHandlerStop
+
+
 async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if not message:
@@ -3855,6 +3902,11 @@ async def unknown_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 def build_application() -> Application:
     application = Application.builder().token(BOT_TOKEN).updater(None).build()
+
+    # Заглушка для пользователей: перехватывает все сообщения и нажатия кнопок
+    # раньше сценариев регистрации/партнёрства. Админы из ADMIN_USER_IDS не блокируются.
+    application.add_handler(MessageHandler(filters.ALL, bot_stub), group=-1)
+    application.add_handler(CallbackQueryHandler(bot_stub_callback), group=-1)
 
     profile_conv = ConversationHandler(
         entry_points=[
